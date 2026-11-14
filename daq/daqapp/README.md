@@ -5,6 +5,7 @@ DaqApp is PER's complete trackside data acquisition and analysis desktop applica
 ## What it does
 
 - Connects to supported CAN sources and decodes traffic with a selected SuperDBC artifact and CAN bus selection
+- Receives live BeamNG vehicle telemetry through the [DAQApp Lua mod](../beamng/README.md), with built-in signal definitions
 - Displays live signals in configurable tables, lists, scopes, and dashboards
 - Configurable widgets for battery data, bus load, jitter, dynamics GPS, G-G plots, and more
 - Logs all received CAN traffic
@@ -28,7 +29,7 @@ DaqApp is PER's complete trackside data acquisition and analysis desktop applica
 
 ## Using the app
 
-1. Use sidebar to select a CAN source from the connection controls (SLCAN, CANnector USB, UDP, or dev modes)
+1. Use sidebar to select a source from the connection controls (SLCAN, CANnector USB, UDP, BeamNG, or dev modes). For BeamNG, follow the [mod setup guide](../beamng/README.md); its signal definitions load automatically, so skip step 2.
 2. Use the sidebar to select a `superdbc_*.json` artifact and its CAN bus or multi-bus preset. The file picker opens in `monorepo/superdbc`, which is an output from the firmware build process
 3. Use the sidebar (or ctrl-P) to launch widgets
 4. Use **Bootloader** to validate and upload a package. See the

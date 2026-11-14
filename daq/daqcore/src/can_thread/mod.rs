@@ -77,6 +77,8 @@ pub struct DatabaseSource {
 /// A bus change reuses its active database.
 #[derive(Debug, Clone)]
 pub enum DatabaseRequest {
+    /// Built-in definitions for the read-only BeamNG telemetry adapter.
+    BeamNg,
     Load {
         path: path::PathBuf,
         preferred_selection: Option<BusSelection>,

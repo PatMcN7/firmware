@@ -2,6 +2,7 @@
 pub enum ConnectionSource {
     Serial(String, CanBusSpeed),
     Udp(u16),
+    BeamNg(u16),
     Cannector,
     Simulated(bool), // true for connected, false for disconnected
     Loopback,
@@ -44,6 +45,12 @@ impl<'de> serde::Deserialize<'de> for ConnectionSource {
             ));
         }
 
+        if let Some(port) = object.get("BeamNg") {
+            return Ok(Self::BeamNg(
+                serde_json::from_value(port.clone()).map_err(serde::de::Error::custom)?,
+            ));
+        }
+
         if let Some(simulated) = object.get("Simulated") {
             let connected = simulated
                 .as_bool()
@@ -77,6 +84,7 @@ impl ConnectionSource {
             }
             ConnectionSource::Cannector => "CANnector (USB)".into(),
             ConnectionSource::Udp(port) => format!("UDP: {}", port),
+            ConnectionSource::BeamNg(port) => format!("BeamNG (localhost:{port})"),
             ConnectionSource::Simulated(connected) => {
                 if *connected {
                     "Simulated (connected)".into()

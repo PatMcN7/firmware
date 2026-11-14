@@ -14,6 +14,17 @@ impl FrameDecoder {
         request: &can_thread::DatabaseRequest,
     ) -> Result<can_thread::DatabaseUpdate, String> {
         match request {
+            can_thread::DatabaseRequest::BeamNg => {
+                let database = crate::beamng::database().map_err(|error| error.to_string())?;
+                let selection = can_thread::BusSelection::Single(0);
+                let update = can_thread::DatabaseUpdate::Loaded {
+                    database: Box::new(database.clone()),
+                    selection,
+                };
+                self.database = Some(database);
+                self.selection = selection;
+                Ok(update)
+            }
             can_thread::DatabaseRequest::Load {
                 path,
                 preferred_selection,

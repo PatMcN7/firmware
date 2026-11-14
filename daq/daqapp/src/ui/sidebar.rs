@@ -178,6 +178,9 @@ fn show_sidebar_contents(ui: &mut eframe::egui::Ui, app: &mut app::DAQApp) {
     });
 
     ui.horizontal_wrapped(|ui| {
+        if app.selection_pending() {
+            ui.disable();
+        }
         let selected_text = match &app.selected_source {
             Some(daqcore::connection::ConnectionSource::Serial(path, speed)) => {
                 format!("Serial: {} ({})", path, speed.display_name())
@@ -240,6 +243,18 @@ fn show_sidebar_contents(ui: &mut eframe::egui::Ui, app: &mut app::DAQApp) {
                     app.connect_can();
                     app.save_settings();
                 }
+                let beamng_source = daqcore::connection::ConnectionSource::BeamNg(app.beamng_port);
+                if ui
+                    .selectable_value(
+                        &mut app.selected_source,
+                        Some(beamng_source),
+                        format!("BeamNG (localhost:{})", app.beamng_port),
+                    )
+                    .changed()
+                {
+                    app.connect_can();
+                    app.save_settings();
+                }
                 ui.separator();
                 ui.label("Simulated");
                 let sim_sources = [
@@ -276,6 +291,31 @@ fn show_sidebar_contents(ui: &mut eframe::egui::Ui, app: &mut app::DAQApp) {
         }
     });
 
+    let beamng_selected = matches!(
+        app.selected_source,
+        Some(daqcore::connection::ConnectionSource::BeamNg(_))
+    );
+    if beamng_selected {
+        ui.add_enabled_ui(!app.selection_pending(), |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("BeamNG UDP Port:");
+                if ui
+                    .add(eframe::egui::DragValue::new(&mut app.beamng_port).range(1..=65535))
+                    .changed()
+                {
+                    app.selected_source = Some(daqcore::connection::ConnectionSource::BeamNg(
+                        app.beamng_port,
+                    ));
+                    app.connect_can();
+                    app.save_settings();
+                }
+            });
+        });
+        ui.label("Read-only • localhost only • built-in signal definitions");
+        ui.label("Enable the DAQApp mod in BeamNG, then drive a vehicle. Default: 30 Hz.");
+        ui.label("Setup guide: daq/beamng/README.md");
+    }
+
     ui.horizontal_wrapped(|ui| {
         // Connection status indicator
         let (status_icon, status_color) = match &app.connection_status {
@@ -283,7 +323,12 @@ fn show_sidebar_contents(ui: &mut eframe::egui::Ui, app: &mut app::DAQApp) {
                 ("■ Disconnected".to_string(), eframe::egui::Color32::GRAY)
             }
             app::ConnectionStatus::Connected => {
-                ("✔ Connected".to_string(), eframe::egui::Color32::GREEN)
+                let label = if beamng_selected {
+                    "✔ Listening for BeamNG"
+                } else {
+                    "✔ Connected"
+                };
+                (label.to_string(), eframe::egui::Color32::GREEN)
             }
             app::ConnectionStatus::Error(e) => {
                 (format!("🔴 Error: {}", e), eframe::egui::Color32::RED)
@@ -292,9 +337,13 @@ fn show_sidebar_contents(ui: &mut eframe::egui::Ui, app: &mut app::DAQApp) {
         ui.label(eframe::egui::RichText::new(status_icon).color(status_color));
     });
 
-    ui.add_enabled_ui(!app.selection_pending(), |ui| {
-        show_database_controls(ui, app);
-    });
+    if beamng_selected {
+        ui.label("Signals: BeamNG (built in). Use CAN Viewer / Scope to plot them.");
+    } else {
+        ui.add_enabled_ui(!app.selection_pending(), |ui| {
+            show_database_controls(ui, app);
+        });
+    }
     if app.selection_pending() {
         ui.label("Applying database selection…");
     }

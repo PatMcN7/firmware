@@ -59,6 +59,7 @@ pub struct DAQApp {
     selection_request: u64,
     pub can_bus_speed: daqcore::connection::CanBusSpeed,
     pub udp_port: u16,
+    pub beamng_port: u16,
     pub router: daqcore::router::VirtualTimelineRouter,
     pub bus_load_samples: Vec<telemetry::BusLoadSample>,
     pub can_thread: daqcore::can_thread::CanThreadHandle,
@@ -82,6 +83,7 @@ impl DAQApp {
             selected_source: self.selected_source.clone(),
             selected_speed: self.can_bus_speed,
             udp_port: self.udp_port,
+            beamng_port: self.beamng_port,
             theme: self.theme_selection,
             pixels_per_point: self.pixels_per_point,
             log_folder: self.log_folder.clone(),
@@ -164,6 +166,7 @@ impl DAQApp {
             selection_request: 0,
             can_bus_speed: settings.selected_speed,
             udp_port: settings.udp_port,
+            beamng_port: settings.beamng_port,
             router,
             bus_load_samples: Vec::new(),
             hil_snapshot: daqcore::hil::engine::HilSnapshot::idle(),
@@ -183,7 +186,12 @@ impl DAQApp {
             }
             None
         });
-        if let Some(path) = default_dbc_path {
+        if matches!(
+            app.selected_source,
+            Some(daqcore::connection::ConnectionSource::BeamNg(_))
+        ) {
+            app.request_selection(daqcore::can_thread::DatabaseRequest::BeamNg);
+        } else if let Some(path) = default_dbc_path {
             app.request_database(&path, preferred_selection);
         }
         Ok(app)
@@ -334,6 +342,12 @@ impl DAQApp {
     }
 
     pub fn connect_can(&mut self) {
+        if matches!(
+            self.selected_source,
+            Some(daqcore::connection::ConnectionSource::BeamNg(_))
+        ) {
+            self.request_selection(daqcore::can_thread::DatabaseRequest::BeamNg);
+        }
         self.enforce_single_bus_if_needed();
         let Some(source) = &self.selected_source else {
             return;

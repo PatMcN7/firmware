@@ -1,5 +1,6 @@
 //! Single-owner CAN libraries. The worker moves events; callers own telemetry history.
 pub mod analysis;
+pub mod beamng;
 pub mod can;
 pub mod can_thread;
 pub mod connection;

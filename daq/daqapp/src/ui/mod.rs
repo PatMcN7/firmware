@@ -8,6 +8,7 @@ pub mod jitter;
 pub mod log_parser;
 pub mod message_picker;
 pub mod scope;
+mod scope_legend;
 pub mod send;
 pub mod sidebar;
 pub mod signal_browser;

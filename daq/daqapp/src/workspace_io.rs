@@ -164,6 +164,8 @@ pub enum PaneSpec {
         x_mode: ui::scope::ScopeXAxisMode,
         #[serde(default = "default_speed_signal")]
         speed_signal_id: String,
+        #[serde(default = "default_true")]
+        show_legend: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         y_bounds: Option<[f64; 2]>,
         #[serde(default)]
@@ -728,6 +730,7 @@ fn capture_widget_spec(widget: &widgets::Widget) -> PaneSpec {
                 custom_title: scope.is_custom_title(),
                 x_mode: scope.x_axis_mode,
                 speed_signal_id: scope.speed_signal_id.clone(),
+                show_legend: scope.show_legend,
                 y_bounds,
                 channels,
                 axes: Vec::new(),
@@ -885,6 +888,7 @@ fn instantiate_pane_spec(
             custom_title,
             x_mode,
             speed_signal_id,
+            show_legend,
             y_bounds,
             channels,
             axes,
@@ -948,7 +952,7 @@ fn instantiate_pane_spec(
             } else {
                 daqcore::analysis::canonicalize_signal_ref(speed_signal_id)
             };
-            widgets::Widget::Scope(ui::scope::Scope::new_configured(
+            let mut scope = ui::scope::Scope::new_configured(
                 id,
                 effective_title,
                 *custom_title && !title.is_empty(),
@@ -956,7 +960,9 @@ fn instantiate_pane_spec(
                 *x_mode,
                 speed_sig,
                 y_bounds_override,
-            ))
+            );
+            scope.show_legend = *show_legend;
+            widgets::Widget::Scope(scope)
         }
         PaneSpec::StateLane {
             title,
@@ -1488,6 +1494,47 @@ impl WorkspaceViewModalState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scope_legend_visibility_round_trips_and_defaults_visible() {
+        let mut scope = ui::scope::Scope::new_multi(
+            1,
+            "Legend",
+            vec![(
+                "message.signal".to_owned(),
+                "Signal".to_owned(),
+                "V".to_owned(),
+            )],
+        );
+        scope.show_legend = false;
+        let spec = capture_widget_spec(&widgets::Widget::Scope(scope));
+        let mut json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["show_legend"], false);
+        let (tx, _rx) = mpsc::channel();
+        let restored = instantiate_pane_spec(
+            &serde_json::from_value(json.clone()).unwrap(),
+            &mut widget_ids::WidgetIds::new(),
+            tx.clone(),
+        );
+        let widgets::Widget::Scope(restored) = restored else {
+            panic!("Expected scope");
+        };
+        assert!(!restored.show_legend);
+
+        json.as_object_mut().unwrap().remove("show_legend");
+        let restored = instantiate_pane_spec(
+            &serde_json::from_value(json).unwrap(),
+            &mut widget_ids::WidgetIds::new(),
+            tx,
+        );
+        let widgets::Widget::Scope(restored) = restored else {
+            panic!("Expected scope");
+        };
+        assert!(
+            restored.show_legend,
+            "Older workspaces keep the legend visible"
+        );
+    }
 
     #[test]
     fn builtin_workspace_presets_load_and_build_tile_trees() {

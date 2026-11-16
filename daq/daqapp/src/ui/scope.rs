@@ -168,6 +168,8 @@ pub struct Scope {
     pub x_axis_mode: ScopeXAxisMode,
     pub speed_signal_id: String,
     pub show_inline_stats: bool,
+    pub show_legend: bool,
+    hidden_channels: std::collections::HashSet<String>,
     y_bounds_override: Option<(f64, f64)>,
     cached_data: Option<CachedScopeData>,
 }
@@ -198,6 +200,8 @@ impl Scope {
             x_axis_mode: ScopeXAxisMode::UtcTime,
             speed_signal_id: "gps_speed_heading.gps_speed".to_owned(),
             show_inline_stats: false,
+            show_legend: true,
+            hidden_channels: std::collections::HashSet::new(),
             y_bounds_override: None,
             cached_data: None,
         }
@@ -214,6 +218,8 @@ impl Scope {
             x_axis_mode: ScopeXAxisMode::UtcTime,
             speed_signal_id: "gps_speed_heading.gps_speed".to_owned(),
             show_inline_stats: false,
+            show_legend: true,
+            hidden_channels: std::collections::HashSet::new(),
             y_bounds_override: None,
             cached_data: None,
         }
@@ -244,6 +250,8 @@ impl Scope {
             x_axis_mode: ScopeXAxisMode::UtcTime,
             speed_signal_id: "gps_speed_heading.gps_speed".to_owned(),
             show_inline_stats: false,
+            show_legend: true,
+            hidden_channels: std::collections::HashSet::new(),
             y_bounds_override: None,
             cached_data: None,
         }
@@ -275,6 +283,8 @@ impl Scope {
             x_axis_mode: ScopeXAxisMode::UtcTime,
             speed_signal_id: "gps_speed_heading.gps_speed".to_owned(),
             show_inline_stats: false,
+            show_legend: true,
+            hidden_channels: std::collections::HashSet::new(),
             y_bounds_override: None,
             cached_data: None,
         }
@@ -299,6 +309,8 @@ impl Scope {
             x_axis_mode,
             speed_signal_id,
             show_inline_stats: false,
+            show_legend: true,
+            hidden_channels: std::collections::HashSet::new(),
             y_bounds_override,
             cached_data: None,
         };
@@ -355,9 +367,18 @@ impl Scope {
         self.refresh_title();
     }
 
+    fn toggle_channel_visibility(&mut self, index: usize) {
+        if let Some(channel) = self.channels.get(index)
+            && !self.hidden_channels.remove(&channel.signal_id)
+        {
+            self.hidden_channels.insert(channel.signal_id.clone());
+        }
+    }
+
     pub fn remove_channel(&mut self, index: usize) {
         if index < self.channels.len() {
-            self.channels.remove(index);
+            let removed = self.channels.remove(index);
+            self.hidden_channels.remove(&removed.signal_id);
             for (i, ch) in self.channels.iter_mut().enumerate() {
                 ch.color = CHANNEL_PALETTE[i % CHANNEL_PALETTE.len()];
             }
@@ -884,89 +905,31 @@ impl Scope {
             }
         }
 
-        // Single compact Nominal-style header strip:
-        // Left: colored channel pills (`■ Label = 3633.1 W`, with `[min, max, avg]` in tooltip or optional inline toggle)
-        // Right: `+` button (add channel) and `…` menu (X-axis mode, speed signal, inline stats toggle, reset Y, CSV export, clear)
-        let mut remove_idx: Option<usize> = None;
+        // One small toolbar. Signal readouts live in the floating legend.
         let mut open_picker: Option<ScopePickerTarget> = None;
         let mut clear_all = false;
         let mut export_csv = false;
 
-        ui.horizontal_wrapped(|ui| {
-            ui.style_mut().wrap_mode = Some(eframe::egui::TextWrapMode::Extend);
-
-            if is_comparison {
-                ui.colored_label(
-                    eframe::egui::Color32::from_rgb(255, 190, 60),
-                    eframe::egui::RichText::new(format!("[Overlay: {}]", comparison_annotations.len()))
-                        .small()
-                        .strong(),
-                );
+        ui.horizontal(|ui| {
+            if ui::scope_legend::toggle_button(ui, self.show_legend).clicked() {
+                self.show_legend = !self.show_legend;
             }
-
-            for (idx, ch) in self.channels.iter().enumerate() {
-                let unit_str = if ch.unit.is_empty() {
-                    String::new()
-                } else {
-                    format!(" {}", ch.unit)
-                };
-                let kind_prefix = if ch.is_derived { "ƒ " } else { "" };
-                let label_note = if !ch.label.is_empty() && ch.label != ch.signal_id {
-                    format!(" ({})", ch.label)
-                } else {
-                    String::new()
-                };
-                let (pill_text, tooltip_text) = if let Some(st) = channel_stats[idx] {
-                    let cur_str = st
-                        .cursor
-                        .map_or_else(|| "—".to_owned(), |v| format!("{v:.2}{unit_str}"));
-                    let pill = if self.show_inline_stats {
-                        format!(
-                            "■ {}{} = {} [min {:.2}, max {:.2}, avg {:.2}]",
-                            kind_prefix, ch.signal_id, cur_str, st.min, st.max, st.mean
-                        )
-                    } else {
-                        format!("■ {}{} = {}", kind_prefix, ch.signal_id, cur_str)
-                    };
-                    let tip = format!(
-                        "{}{}\nCursor: {}\nWindow Min: {:.3}{}\nWindow Max: {:.3}{}\nWindow Avg: {:.3}{}",
-                        ch.signal_id, label_note, cur_str, st.min, unit_str, st.max, unit_str, st.mean, unit_str
-                    );
-                    (pill, tip)
-                } else {
-                    (
-                        format!("■ {}{}{}", kind_prefix, ch.signal_id, unit_str),
-                        format!("{}{} (no samples in active window)", ch.signal_id, label_note),
-                    )
-                };
-
-                ui.colored_label(
-                    ch.color,
-                    eframe::egui::RichText::new(pill_text).size(11.5),
-                )
-                .on_hover_text(tooltip_text);
-                if ui
-                    .small_button("×")
-                    .on_hover_text(format!("Remove {}", ch.signal_id))
-                    .clicked()
-                {
-                    remove_idx = Some(idx);
-                }
-                ui.add_space(4.0);
-            }
-
-            if ui
-                .small_button("+")
-                .on_hover_text("Add another signal or derived formula to this Scope")
-                .clicked()
-            {
+            if ui.small_button("+").on_hover_text("Add signal").clicked() {
                 open_picker = Some(ScopePickerTarget::AddChannel);
             }
-
+            if is_comparison {
+                ui.label(
+                    eframe::egui::RichText::new(format!(
+                        "Comparing ({})",
+                        comparison_annotations.len()
+                    ))
+                    .small(),
+                );
+            }
             if self.x_axis_mode != ScopeXAxisMode::UtcTime
                 && ui
                     .small_button(self.x_axis_mode.label())
-                    .on_hover_text("Click to return to UTC Time X-axis")
+                    .on_hover_text("Use time axis")
                     .clicked()
             {
                 self.x_axis_mode = ScopeXAxisMode::UtcTime;
@@ -1008,52 +971,51 @@ impl Scope {
                             self.refresh_title();
                         }
                     });
-                ui.separator();
-                ui.label(eframe::egui::RichText::new("X-Axis Mode").weak().small());
-                for mode in [
-                    ScopeXAxisMode::UtcTime,
-                    ScopeXAxisMode::ElapsedTime,
-                    ScopeXAxisMode::TrackDistance,
-                ] {
-                    if ui
-                        .selectable_label(self.x_axis_mode == mode, mode.label())
-                        .clicked()
-                    {
-                        self.x_axis_mode = mode;
-                        if mode == ScopeXAxisMode::TrackDistance && self.speed_signal_id.is_empty()
+                    ui.separator();
+                    ui.label(eframe::egui::RichText::new("X-Axis Mode").weak().small());
+                    for mode in [
+                        ScopeXAxisMode::UtcTime,
+                        ScopeXAxisMode::ElapsedTime,
+                        ScopeXAxisMode::TrackDistance,
+                    ] {
+                        if ui
+                            .selectable_label(self.x_axis_mode == mode, mode.label())
+                            .clicked()
                         {
-                            self.speed_signal_id = view.resolve_default_speed_signal();
+                            self.x_axis_mode = mode;
+                            if mode == ScopeXAxisMode::TrackDistance
+                                && self.speed_signal_id.is_empty()
+                            {
+                                self.speed_signal_id = view.resolve_default_speed_signal();
+                            }
+                            ui.close();
                         }
+                    }
+                    if self.x_axis_mode == ScopeXAxisMode::TrackDistance
+                        && ui
+                            .button(format!("Speed Signal: {}…", self.speed_signal_id))
+                            .on_hover_text(&self.speed_signal_id)
+                            .clicked()
+                    {
+                        open_picker = Some(ScopePickerTarget::SpeedSignal);
                         ui.close();
                     }
-                }
-                if self.x_axis_mode == ScopeXAxisMode::TrackDistance
-                    && ui
-                        .button(format!("Speed Signal: {}…", self.speed_signal_id))
-                        .on_hover_text(&self.speed_signal_id)
-                        .clicked()
-                {
-                    open_picker = Some(ScopePickerTarget::SpeedSignal);
-                    ui.close();
-                }
-                ui.separator();
-                ui.checkbox(
-                    &mut self.show_inline_stats,
-                    "Show [min, max, avg] inline",
-                );
-                if self.y_bounds_override.is_some() && ui.button("Reset Y-Axis Zoom").clicked() {
-                    self.y_bounds_override = None;
-                    ui.close();
-                }
-                if ui.button("Export CSV…").clicked() {
-                    export_csv = true;
-                    ui.close();
-                }
-                if self.channels.len() > 1 && ui.button("Clear All Channels").clicked() {
-                    clear_all = true;
-                    ui.close();
-                }
-            });
+                    ui.separator();
+                    ui.checkbox(&mut self.show_inline_stats, "Show statistics");
+                    if self.y_bounds_override.is_some() && ui.button("Reset Y-Axis Zoom").clicked()
+                    {
+                        self.y_bounds_override = None;
+                        ui.close();
+                    }
+                    if ui.button("Export CSV…").clicked() {
+                        export_csv = true;
+                        ui.close();
+                    }
+                    if self.channels.len() > 1 && ui.button("Clear All Channels").clicked() {
+                        clear_all = true;
+                        ui.close();
+                    }
+                });
         });
 
         if export_csv
@@ -1075,16 +1037,13 @@ impl Scope {
             }
         }
 
-        if let Some(idx) = remove_idx {
-            self.remove_channel(idx);
-            return egui_tiles::UiResponse::None;
-        }
         if let Some(target) = open_picker {
             self.picker_target = Some(target);
             return egui_tiles::UiResponse::None;
         }
         if clear_all {
             self.channels.clear();
+            self.hidden_channels.clear();
             self.cached_data = None;
             self.custom_title = false;
             self.refresh_title();
@@ -1187,8 +1146,68 @@ impl Scope {
         let (active_y_min, active_y_max) =
             self.y_bounds_override.unwrap_or((primary_min, primary_max));
         let mut next_y_override = self.y_bounds_override;
+        let show_legend = self.show_legend;
+        let show_statistics = self.show_inline_stats;
+        let legend_entries: Vec<ui::scope_legend::Entry> = if is_comparison {
+            cached
+                .mapped_traces
+                .iter()
+                .enumerate()
+                .filter_map(|(index, trace)| {
+                    let channel_index = index / comparison_annotations.len();
+                    let channel = self.channels.get(channel_index)?;
+                    let annotation = &comparison_annotations[index % comparison_annotations.len()];
+                    Some(ui::scope_legend::Entry {
+                        channel_index,
+                        label: format!(
+                            "{} ({})",
+                            ui::scope_legend::short_label(channel),
+                            annotation.name
+                        ),
+                        signal_id: channel.signal_id.clone(),
+                        value: None,
+                        color: trace.color,
+                        style: trace.style,
+                        stats: None,
+                        visible: !self.hidden_channels.contains(&channel.signal_id),
+                    })
+                })
+                .collect()
+        } else {
+            self.channels
+                .iter()
+                .enumerate()
+                .map(|(index, channel)| {
+                    let stats = channel_stats[index];
+                    let value = stats
+                        .and_then(|stats| stats.cursor)
+                        .map(|value| {
+                            if channel.unit.is_empty() {
+                                format!("{value:.2}")
+                            } else {
+                                format!("{value:.2} {}", channel.unit)
+                            }
+                        })
+                        .unwrap_or_else(|| "No data".to_owned());
+                    ui::scope_legend::Entry {
+                        channel_index: index,
+                        label: if channel.is_derived {
+                            format!("ƒ {}", ui::scope_legend::short_label(channel))
+                        } else {
+                            ui::scope_legend::short_label(channel).to_owned()
+                        },
+                        signal_id: channel.signal_id.clone(),
+                        value: Some(value),
+                        color: channel.color,
+                        style: egui_plot::LineStyle::Solid,
+                        stats,
+                        visible: !self.hidden_channels.contains(&channel.signal_id),
+                    }
+                })
+                .collect()
+        };
 
-        let mut plot = egui_plot::Plot::new(plot_id)
+        let plot = egui_plot::Plot::new(plot_id)
             .custom_y_axes(y_axes)
             .width(plot_width)
             .height(plot_height)
@@ -1205,16 +1224,29 @@ impl Scope {
                     start.offset(offset_ms).label()
                 }
             });
-        // Only show the in-plot legend box when comparing multiple laps/stints (to distinguish solid vs dashed laps);
-        // in standard mode, the compact channel pills in the header strip already serve as the color-coded legend + live readout.
-        if is_comparison {
-            plot = plot.legend(egui_plot::Legend::default());
-        }
-        plot.show(ui, |plot_ui| {
+        // Temporary visibility does not invalidate samples or rescale the axes.
+        let channel_visible: Vec<bool> = self
+            .channels
+            .iter()
+            .map(|channel| !self.hidden_channels.contains(&channel.signal_id))
+            .collect();
+        let traces_per_channel = if is_comparison {
+            comparison_annotations.len()
+        } else {
+            1
+        };
+        let plot_response = plot.show(ui, |plot_ui| {
             plot_ui.set_plot_bounds_x(0.0..=max_x_bound);
             plot_ui.set_plot_bounds_y(active_y_min..=active_y_max);
 
-            for trace in &cached.mapped_traces {
+            for (index, trace) in cached.mapped_traces.iter().enumerate() {
+                if !channel_visible
+                    .get(index / traces_per_channel)
+                    .copied()
+                    .unwrap_or(true)
+                {
+                    continue;
+                }
                 let fill_color = trace.color.gamma_multiply(0.22);
                 let band_stroke =
                     eframe::egui::Stroke::new(0.5_f32, trace.color.gamma_multiply(0.35));
@@ -1259,7 +1291,37 @@ impl Scope {
                 );
             }
 
-            let popup_open = eframe::egui::Popup::is_any_open(plot_ui.ctx());
+            let legend_interaction = show_legend
+                && ui::scope_legend::bounds(
+                    *plot_ui.transform().frame(),
+                    legend_entries.len(),
+                    show_statistics,
+                )
+                .is_some_and(|rect| {
+                    plot_ui.ctx().input(|input| {
+                        input
+                            .pointer
+                            .hover_pos()
+                            .is_some_and(|pos| rect.contains(pos))
+                            || input
+                                .pointer
+                                .press_origin()
+                                .is_some_and(|pos| rect.contains(pos))
+                    })
+                });
+            // Keep a wheel gesture owned by the legend through its smoothed tail.
+            let scrolling = plot_ui
+                .ctx()
+                .input(|input| input.smooth_scroll_delta != eframe::egui::Vec2::ZERO);
+            let scroll_id =
+                eframe::egui::Id::new(("scope_legend_scroll_capture", self.instance_num));
+            let legend_scroll_captured = plot_ui.ctx().data_mut(|data| {
+                let captured = scrolling
+                    && (legend_interaction || data.get_temp::<bool>(scroll_id).unwrap_or(false));
+                data.insert_temp(scroll_id, captured);
+                captured
+            });
+            let popup_open = eframe::egui::Popup::is_any_open(plot_ui.ctx()) || legend_interaction;
             let mut pointer_utc_ms: Option<i64> = None;
             let mut pointer_plot_y: Option<f64> = None;
             if !popup_open
@@ -1310,7 +1372,7 @@ impl Scope {
                 let span_ms = (end_ms - start_ms).max(daqcore::timeline::MIN_WINDOW_MS) as f64;
                 let anchor_ms = pointer_utc_ms.unwrap_or_else(|| view.timeline.setpoint_utc_ms());
 
-                if plot_ui.response().hovered() {
+                if plot_ui.response().hovered() && !legend_scroll_captured {
                     let (scroll, zoom_delta, shift_held) = plot_ui
                         .ctx()
                         .input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.modifiers.shift));
@@ -1369,6 +1431,25 @@ impl Scope {
             }
         });
         self.y_bounds_override = next_y_override;
+        if show_legend
+            && let Some(rect) = ui::scope_legend::bounds(
+                *plot_response.transform.frame(),
+                legend_entries.len(),
+                show_statistics,
+            )
+            && let Some(action) = ui::scope_legend::show(
+                ui,
+                rect,
+                self.instance_num,
+                &legend_entries,
+                show_statistics,
+            )
+        {
+            match action {
+                ui::scope_legend::Action::Remove(index) => self.remove_channel(index),
+                ui::scope_legend::Action::Toggle(index) => self.toggle_channel_visibility(index),
+            }
+        }
 
         egui_tiles::UiResponse::None
     }
@@ -1635,6 +1716,206 @@ fn interpolate_ms_at_distance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn floating_legend_toggle_and_interactions_stay_out_of_plot_navigation() {
+        use eframe::egui::{self, Event, Modifiers, PointerButton};
+
+        fn frame(
+            ctx: &egui::Context,
+            scope: &mut Scope,
+            router: &daqcore::router::VirtualTimelineRouter,
+            events: Vec<Event>,
+        ) -> egui::FullOutput {
+            let view = workspace_view::WorkspaceDataView::new(router);
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 500.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let _ = scope.show(ui, &view);
+                    });
+                },
+            );
+            assert_eq!(
+                view.requested_setpoint_utc_ms(),
+                None,
+                "Legend clicks cannot scrub"
+            );
+            assert_eq!(
+                view.requested_pan_delta_ms(),
+                None,
+                "Legend drags cannot pan"
+            );
+            assert_eq!(view.requested_zoom(), None, "Legend scrolling cannot zoom");
+            output
+        }
+        fn find(output: &egui::FullOutput, label: &str) -> Option<egui::Pos2> {
+            output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == label => {
+                    let center = text.pos + text.galley.size() * 0.5;
+                    shape.clip_rect.contains(center).then_some(center)
+                }
+                _ => None,
+            })
+        }
+        fn click(
+            ctx: &egui::Context,
+            scope: &mut Scope,
+            router: &daqcore::router::VirtualTimelineRouter,
+            pos: egui::Pos2,
+        ) -> egui::FullOutput {
+            frame(ctx, scope, router, vec![Event::PointerMoved(pos)]);
+            for pressed in [true, false] {
+                frame(
+                    ctx,
+                    scope,
+                    router,
+                    vec![Event::PointerButton {
+                        pos,
+                        button: PointerButton::Primary,
+                        pressed,
+                        modifiers: Modifiers::NONE,
+                    }],
+                );
+            }
+            frame(ctx, scope, router, vec![])
+        }
+
+        let ctx = egui::Context::default();
+        ui::theme::store_theme(&ctx, ui::theme::ThemeSelection::default().get_colors());
+        let router = daqcore::router::VirtualTimelineRouter::live(
+            daqcore::time::Time::from_unix_millis(100_000),
+            30.0,
+        )
+        .unwrap();
+        let mut scope = Scope::new_multi(
+            1,
+            "Legend test",
+            (0..20)
+                .map(|index| {
+                    (
+                        format!("message.signal_{index}"),
+                        format!("Channel {index}"),
+                        "V".to_owned(),
+                    )
+                })
+                .collect(),
+        );
+        frame(&ctx, &mut scope, &router, vec![]);
+        let output = frame(&ctx, &mut scope, &router, vec![]);
+        let toggle = egui::pos2(20.0, 17.0);
+        assert!(find(&output, "Legend").is_none(), "The toggle is icon only");
+        let entry = find(&output, "Channel 0").expect("Floating legend is visible");
+        assert!(
+            entry.x < 450.0 && entry.y > 250.0,
+            "Legend belongs at the bottom left"
+        );
+        let panel = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect)
+                    if rect.rect.width() >= 150.0
+                        && rect.rect.width() <= 330.0
+                        && rect.rect.height() <= 190.0 =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .expect("Legend panel");
+        let eye = egui::pos2(panel.right() - 17.0, entry.y);
+        let key = scope.cached_data.as_ref().unwrap().key.clone();
+        let colors: Vec<_> = scope.channels.iter().map(|channel| channel.color).collect();
+        click(&ctx, &mut scope, &router, eye);
+        assert!(scope.hidden_channels.contains("message.signal_0"));
+        assert_eq!(
+            scope.channels.len(),
+            20,
+            "Hiding does not remove the signal"
+        );
+        assert!(
+            !egui::Popup::is_any_open(&ctx),
+            "The eye does not open channel details"
+        );
+        click(&ctx, &mut scope, &router, eye);
+        assert!(!scope.hidden_channels.contains("message.signal_0"));
+        assert_eq!(scope.cached_data.as_ref().unwrap().key, key);
+        assert_eq!(
+            scope
+                .channels
+                .iter()
+                .map(|channel| channel.color)
+                .collect::<Vec<_>>(),
+            colors
+        );
+        assert!(
+            find(&output, "Channel 19").is_none(),
+            "Long legends scroll instead of growing"
+        );
+        frame(
+            &ctx,
+            &mut scope,
+            &router,
+            vec![
+                Event::PointerMoved(entry),
+                Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -20.0),
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &ctx,
+            &mut scope,
+            &router,
+            vec![Event::PointerButton {
+                pos: entry,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        let dragged = entry - egui::vec2(60.0, 0.0);
+        frame(
+            &ctx,
+            &mut scope,
+            &router,
+            vec![Event::PointerMoved(dragged)],
+        );
+        frame(
+            &ctx,
+            &mut scope,
+            &router,
+            vec![Event::PointerButton {
+                pos: dragged,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        // Toggling the overlay must not change the plot or lose its scroll position.
+        let output = click(&ctx, &mut scope, &router, toggle);
+        assert!(!scope.show_legend);
+        assert!(find(&output, "Channel 0").is_none());
+        let output = click(&ctx, &mut scope, &router, toggle);
+        assert!(scope.show_legend);
+        let entry = find(&output, "Channel 0")
+            .or_else(|| find(&output, "Channel 1"))
+            .expect("Visible legend row");
+        let output = click(&ctx, &mut scope, &router, entry);
+        let remove = find(&output, "Remove signal").expect("Channel details popup");
+        click(&ctx, &mut scope, &router, remove);
+        assert_eq!(scope.channels.len(), 19);
+    }
 
     #[test]
     fn unit_axis_transform_roundtrips_physical_values() {

@@ -292,6 +292,8 @@ pub fn show(app: &mut app::DAQApp, ctx: &eframe::egui::Context) {
     let next_hover_dist = view.hover_distance_m();
     let requested_setpoint_ms = view.requested_setpoint_utc_ms();
     let requested_zoom = view.requested_zoom();
+    let requested_range = view.requested_range_ms();
+    let requested_pause = view.requested_pause();
     let requested_pan_delta_ms = view.requested_pan_delta_ms();
 
     if hover_touched {
@@ -300,6 +302,9 @@ pub fn show(app: &mut app::DAQApp, ctx: &eframe::egui::Context) {
     } else {
         app.hover_utc_ms = None;
         app.hover_distance_m = None;
+    }
+    if requested_pause {
+        app.router.timeline_mut().pause();
     }
     if let Some((anchor_ms, zoom_factor)) = requested_zoom {
         app.router
@@ -313,6 +318,13 @@ pub fn show(app: &mut app::DAQApp, ctx: &eframe::egui::Context) {
             .start_utc_ms()
             .saturating_add(delta_ms);
         app.router.timeline_mut().pan_to_start_ms(next_start_ms);
+    }
+    if let Some((start, end)) = requested_range {
+        let cursor = app.router.timeline().setpoint_utc_ms().clamp(start, end);
+        let timeline = app.router.timeline_mut();
+        timeline.set_playing(false);
+        timeline.snap_to_range_ms(start, end);
+        timeline.set_setpoint(daqcore::time::Time::from_unix_millis(cursor));
     }
     if let Some(setpoint_ms) = requested_setpoint_ms {
         app.router
@@ -1022,7 +1034,7 @@ mod tests {
             "MasterTimeline span should shrink after zooming on Scope ({zoomed_span_ms} vs {initial_span_ms})"
         );
 
-        // Verify left-clicking and dragging horizontally on Scope pans the MasterTimeline
+        // Right dragging pans the shared timeline while left dragging selects a range.
         let press_view = workspace_view::WorkspaceDataView::with_hover(&router, Some(mid_ms), None);
         let press_input = eframe::egui::RawInput {
             screen_rect: Some(screen_rect),
@@ -1030,7 +1042,7 @@ mod tests {
                 eframe::egui::Event::PointerMoved(eframe::egui::pos2(300.0, 220.0)),
                 eframe::egui::Event::PointerButton {
                     pos: eframe::egui::pos2(300.0, 220.0),
-                    button: eframe::egui::PointerButton::Primary,
+                    button: eframe::egui::PointerButton::Secondary,
                     pressed: true,
                     modifiers: eframe::egui::Modifiers::NONE,
                 },

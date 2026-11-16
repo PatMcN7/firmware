@@ -1,6 +1,13 @@
 use crate::{ui, workspace_view};
 use std::fs;
 
+#[path = "scope_plot.rs"]
+mod plot;
+
+#[cfg(test)]
+#[path = "scope_workflows.rs"]
+mod workflows;
+
 pub const CHANNEL_PALETTE: [eframe::egui::Color32; 8] = [
     eframe::egui::Color32::from_rgb(80, 190, 255), // Sky Blue
     eframe::egui::Color32::from_rgb(255, 160, 60), // Amber Orange
@@ -118,6 +125,7 @@ struct ScopeCacheKey {
     comparison_ids: Vec<String>,
     channel_specs: Vec<(String, String, String, eframe::egui::Color32)>,
     data_revision: u64,
+    configuration: String,
 }
 
 enum ChannelCursorLookup {
@@ -169,6 +177,12 @@ pub struct Scope {
     pub speed_signal_id: String,
     pub show_inline_stats: bool,
     pub show_legend: bool,
+    pub config: ui::scope_settings::ScopeConfig,
+    inspector: Option<(String, ui::scope_settings::InspectorTab)>,
+    gesture: Option<ui::scope_interaction::Gesture>,
+    measurements: ui::scope_interaction::Measurements,
+    lane_y_overrides: std::collections::BTreeMap<usize, (f64, f64)>,
+    plot_frames: Vec<eframe::egui::Rect>,
     hidden_channels: std::collections::HashSet<String>,
     y_bounds_override: Option<(f64, f64)>,
     cached_data: Option<CachedScopeData>,
@@ -202,6 +216,12 @@ impl Scope {
             show_inline_stats: false,
             show_legend: true,
             hidden_channels: std::collections::HashSet::new(),
+            config: ui::scope_settings::ScopeConfig::default(),
+            inspector: None,
+            gesture: None,
+            measurements: ui::scope_interaction::Measurements::default(),
+            lane_y_overrides: std::collections::BTreeMap::new(),
+            plot_frames: Vec::new(),
             y_bounds_override: None,
             cached_data: None,
         }
@@ -220,6 +240,12 @@ impl Scope {
             show_inline_stats: false,
             show_legend: true,
             hidden_channels: std::collections::HashSet::new(),
+            config: ui::scope_settings::ScopeConfig::default(),
+            inspector: None,
+            gesture: None,
+            measurements: ui::scope_interaction::Measurements::default(),
+            lane_y_overrides: std::collections::BTreeMap::new(),
+            plot_frames: Vec::new(),
             y_bounds_override: None,
             cached_data: None,
         }
@@ -252,6 +278,12 @@ impl Scope {
             show_inline_stats: false,
             show_legend: true,
             hidden_channels: std::collections::HashSet::new(),
+            config: ui::scope_settings::ScopeConfig::default(),
+            inspector: None,
+            gesture: None,
+            measurements: ui::scope_interaction::Measurements::default(),
+            lane_y_overrides: std::collections::BTreeMap::new(),
+            plot_frames: Vec::new(),
             y_bounds_override: None,
             cached_data: None,
         }
@@ -285,6 +317,12 @@ impl Scope {
             show_inline_stats: false,
             show_legend: true,
             hidden_channels: std::collections::HashSet::new(),
+            config: ui::scope_settings::ScopeConfig::default(),
+            inspector: None,
+            gesture: None,
+            measurements: ui::scope_interaction::Measurements::default(),
+            lane_y_overrides: std::collections::BTreeMap::new(),
+            plot_frames: Vec::new(),
             y_bounds_override: None,
             cached_data: None,
         }
@@ -311,6 +349,12 @@ impl Scope {
             show_inline_stats: false,
             show_legend: true,
             hidden_channels: std::collections::HashSet::new(),
+            config: ui::scope_settings::ScopeConfig::default(),
+            inspector: None,
+            gesture: None,
+            measurements: ui::scope_interaction::Measurements::default(),
+            lane_y_overrides: std::collections::BTreeMap::new(),
+            plot_frames: Vec::new(),
             y_bounds_override,
             cached_data: None,
         };
@@ -354,7 +398,11 @@ impl Scope {
             self.picker_target = None;
             return;
         }
-        let color = CHANNEL_PALETTE[self.channels.len() % CHANNEL_PALETTE.len()];
+        let color = CHANNEL_PALETTE
+            .iter()
+            .copied()
+            .find(|color| !self.channels.iter().any(|channel| channel.color == *color))
+            .unwrap_or(CHANNEL_PALETTE[self.channels.len() % CHANNEL_PALETTE.len()]);
         self.channels.push(ScopeChannel {
             signal_id,
             label,
@@ -379,9 +427,7 @@ impl Scope {
         if index < self.channels.len() {
             let removed = self.channels.remove(index);
             self.hidden_channels.remove(&removed.signal_id);
-            for (i, ch) in self.channels.iter_mut().enumerate() {
-                ch.color = CHANNEL_PALETTE[i % CHANNEL_PALETTE.len()];
-            }
+            self.config.channels.remove(&removed.signal_id);
             if self.channels.is_empty() {
                 self.custom_title = false;
                 self.picker_target = Some(ScopePickerTarget::AddChannel);
@@ -475,6 +521,7 @@ impl Scope {
         ui: &mut eframe::egui::Ui,
         view: &workspace_view::WorkspaceDataView<'_>,
     ) -> egui_tiles::UiResponse {
+        self.config.sanitize();
         let pane_rect = ui.max_rect();
         if let Some(payload) =
             eframe::egui::DragAndDrop::payload::<ui::signal_browser::DraggedSignal>(ui.ctx())
@@ -486,7 +533,9 @@ impl Scope {
                 eframe::egui::Stroke::new(2.0_f32, eframe::egui::Color32::from_rgb(80, 190, 255)),
                 eframe::egui::StrokeKind::Inside,
             );
-            if ui.input(|i| i.pointer.any_released()) {
+            if (!self.config.stacked || self.channels.is_empty())
+                && ui.input(|i| i.pointer.any_released())
+            {
                 self.apply_dragged_signal((*payload).clone());
                 let _ = eframe::egui::DragAndDrop::take_payload::<ui::signal_browser::DraggedSignal>(
                     ui.ctx(),
@@ -534,7 +583,6 @@ impl Scope {
         let start_ms = start.unix_millis();
         let end_ms = view.timeline.end_utc_ms();
         let duration_s = view.timeline.end().secs(start).max(0.001);
-        let playhead_s = view.timeline.setpoint().secs(start);
 
         let comparison_ids: Vec<String> = comparison_annotations
             .iter()
@@ -562,6 +610,7 @@ impl Scope {
             comparison_ids,
             channel_specs,
             data_revision: view.data_revision(),
+            configuration: serde_json::to_string(&self.config).unwrap_or_default(),
         };
 
         if self.cached_data.as_ref().is_none_or(|c| c.key != cache_key) {
@@ -569,11 +618,12 @@ impl Scope {
             let mut unit_groups: Vec<String> = Vec::new();
             let mut channel_unit_group: Vec<usize> = Vec::with_capacity(self.channels.len());
             for ch in &self.channels {
+                let axis_key = self.config.axis_key(ch);
                 let pos = unit_groups
                     .iter()
-                    .position(|u| u == &ch.unit)
+                    .position(|u| u == &axis_key)
                     .unwrap_or_else(|| {
-                        unit_groups.push(ch.unit.clone());
+                        unit_groups.push(axis_key.clone());
                         unit_groups.len() - 1
                     });
                 channel_unit_group.push(pos);
@@ -619,11 +669,7 @@ impl Scope {
                             width_px,
                         );
                         let style = line_styles[lap_idx % line_styles.len()];
-                        let trace_color = if self.channels.len() == 1 {
-                            CHANNEL_PALETTE[lap_idx % CHANNEL_PALETTE.len()]
-                        } else {
-                            ch.color
-                        };
+                        let trace_color = ch.color;
 
                         if self.x_axis_mode == ScopeXAxisMode::TrackDistance {
                             let dist_series = view.query_signal_vs_distance(
@@ -805,8 +851,16 @@ impl Scope {
             // Normalize unit bounds and build multi-unit Y transforms.
             let normalized_bounds: Vec<(f64, f64)> = unit_bounds
                 .iter()
-                .map(|&(lo, hi)| {
-                    if !lo.is_finite() || !hi.is_finite() {
+                .enumerate()
+                .map(|(index, &(lo, hi))| {
+                    if let Some(range) = self
+                        .config
+                        .axes
+                        .get(&unit_groups[index])
+                        .and_then(|axis| axis.valid_range())
+                    {
+                        range
+                    } else if !lo.is_finite() || !hi.is_finite() {
                         (-1.0, 1.0)
                     } else if (hi - lo).abs() < 1e-6 {
                         let pad = (lo.abs() * 0.05).max(1.0);
@@ -914,6 +968,16 @@ impl Scope {
             if ui::scope_legend::toggle_button(ui, self.show_legend).clicked() {
                 self.show_legend = !self.show_legend;
             }
+            if ui::scope_icons::button(ui, true, self.config.stacked).clicked() {
+                self.config.toggle_stack(&self.channels);
+                self.cached_data = None;
+                self.lane_y_overrides.clear();
+                return;
+            }
+            if ui::scope_icons::button(ui, false, self.measurements.enabled).clicked() {
+                self.measurements.enabled = !self.measurements.enabled;
+                self.gesture = None;
+            }
             if ui.small_button("+").on_hover_text("Add signal").clicked() {
                 open_picker = Some(ScopePickerTarget::AddChannel);
             }
@@ -1002,6 +1066,52 @@ impl Scope {
                     }
                     ui.separator();
                     ui.checkbox(&mut self.show_inline_stats, "Show statistics");
+                    ui.menu_button("Plots", |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Count");
+                            if ui
+                                .add(
+                                    eframe::egui::DragValue::new(&mut self.config.lanes)
+                                        .range(1..=8),
+                                )
+                                .changed()
+                            {
+                                self.config.stacked = self.config.lanes > 1;
+                                self.config.sanitize();
+                                self.cached_data = None;
+                            }
+                        });
+                        if ui.button("Split signals").clicked() {
+                            self.config.stacked = true;
+                            for (index, channel) in self.channels.iter().enumerate() {
+                                self.config
+                                    .channels
+                                    .entry(channel.signal_id.clone())
+                                    .or_default()
+                                    .lane = index % self.config.lanes;
+                            }
+                            self.cached_data = None;
+                            ui.close();
+                        }
+                        if ui.button("Combine signals").clicked() {
+                            self.config.stacked = false;
+                            self.cached_data = None;
+                            ui.close();
+                        }
+                    });
+                    ui.menu_button("Cursors", |ui| {
+                        for (slot, label) in [(0, "Set A"), (1, "Set B")] {
+                            if ui.button(label).clicked() {
+                                self.measurements.enabled = true;
+                                self.measurements.next = slot;
+                                ui.close();
+                            }
+                        }
+                        if ui.button("Clear cursors").clicked() {
+                            self.measurements.pins = [None, None];
+                            ui.close();
+                        }
+                    });
                     if self.y_bounds_override.is_some() && ui.button("Reset Y-Axis Zoom").clicked()
                     {
                         self.y_bounds_override = None;
@@ -1044,6 +1154,8 @@ impl Scope {
         if clear_all {
             self.channels.clear();
             self.hidden_channels.clear();
+            self.config.channels.clear();
+            self.config.axes.clear();
             self.cached_data = None;
             self.custom_title = false;
             self.refresh_title();
@@ -1051,407 +1163,7 @@ impl Scope {
             return egui_tiles::UiResponse::None;
         }
 
-        let Some(cached) = self.cached_data.as_ref() else {
-            return egui_tiles::UiResponse::None;
-        };
-
-        if cached
-            .mapped_traces
-            .iter()
-            .all(|t| t.mean_points.is_empty())
-        {
-            ui.label("No retained samples in the selected interval.");
-        }
-
-        let primary_min = cached.primary_min;
-        let primary_max = cached.primary_max;
-        let max_x_bound = cached.max_x_bound;
-        let multi_unit = cached.unit_groups.len() > 1;
-        let y_axes: Vec<egui_plot::AxisHints<'static>> = cached
-            .unit_groups
-            .iter()
-            .enumerate()
-            .map(|(u_idx, unit_name)| {
-                let placement = if u_idx % 2 == 0 {
-                    egui_plot::HPlacement::Left
-                } else {
-                    egui_plot::HPlacement::Right
-                };
-                let tf = cached.unit_transforms[u_idx];
-                let mut hints = egui_plot::AxisHints::new_y()
-                    .placement(placement)
-                    .formatter(move |mark, _range| {
-                        let phys = tf.plot_to_phys(mark.value);
-                        let phys_step = (mark.step_size / tf.scale.abs().max(1e-9)).max(1e-6);
-                        let decimals = (-phys_step.log10().floor() as isize).clamp(0, 3) as usize;
-                        eframe::egui::emath::format_with_decimals_in_range(
-                            phys,
-                            decimals..=decimals,
-                        )
-                    });
-                if multi_unit && !unit_name.is_empty() {
-                    hints = hints.label(unit_name.clone());
-                }
-                hints
-            })
-            .collect();
-
-        let x_axis_mode = self.x_axis_mode;
-
-        // Compute playhead X and linked hover X in the current X-axis coordinate system.
-        let playhead_x: Option<f64> =
-            if is_comparison {
-                None
-            } else {
-                match x_axis_mode {
-                    ScopeXAxisMode::UtcTime | ScopeXAxisMode::ElapsedTime => Some(playhead_s),
-                    ScopeXAxisMode::TrackDistance => cached
-                        .primary_distance_lookup
-                        .as_ref()
-                        .and_then(|(_, ts, ds)| {
-                            interpolate_distance_at_ms(ts, ds, view.timeline.setpoint_utc_ms())
-                        }),
-                }
-            };
-
-        let hover_x: Option<f64> = match x_axis_mode {
-            ScopeXAxisMode::TrackDistance => view.hover_distance_m().or_else(|| {
-                let hover_ms = view.hover_utc_ms()?;
-                let (_, ts, ds) = cached.primary_distance_lookup.as_ref()?;
-                interpolate_distance_at_ms(ts, ds, hover_ms)
-            }),
-            ScopeXAxisMode::UtcTime | ScopeXAxisMode::ElapsedTime => {
-                view.hover_utc_ms().map(|hover_ms| {
-                    let ref_start_ms = if is_comparison {
-                        comparison_annotations
-                            .first()
-                            .map_or(start_ms, |a| a.start_utc_ms)
-                    } else {
-                        start_ms
-                    };
-                    ((hover_ms - ref_start_ms) as f64) / 1000.0
-                })
-            }
-        };
-
-        let plot_width = ui.available_width().max(60.0);
-        let plot_height = ui.available_height().max(60.0);
-
-        let plot_id = (
-            "scope_plot_v2",
-            self.instance_num,
-            is_comparison,
-            x_axis_mode as u8,
-        );
-        let (active_y_min, active_y_max) =
-            self.y_bounds_override.unwrap_or((primary_min, primary_max));
-        let mut next_y_override = self.y_bounds_override;
-        let show_legend = self.show_legend;
-        let show_statistics = self.show_inline_stats;
-        let legend_entries: Vec<ui::scope_legend::Entry> = if is_comparison {
-            cached
-                .mapped_traces
-                .iter()
-                .enumerate()
-                .filter_map(|(index, trace)| {
-                    let channel_index = index / comparison_annotations.len();
-                    let channel = self.channels.get(channel_index)?;
-                    let annotation = &comparison_annotations[index % comparison_annotations.len()];
-                    Some(ui::scope_legend::Entry {
-                        channel_index,
-                        label: format!(
-                            "{} ({})",
-                            ui::scope_legend::short_label(channel),
-                            annotation.name
-                        ),
-                        signal_id: channel.signal_id.clone(),
-                        value: None,
-                        color: trace.color,
-                        style: trace.style,
-                        stats: None,
-                        visible: !self.hidden_channels.contains(&channel.signal_id),
-                    })
-                })
-                .collect()
-        } else {
-            self.channels
-                .iter()
-                .enumerate()
-                .map(|(index, channel)| {
-                    let stats = channel_stats[index];
-                    let value = stats
-                        .and_then(|stats| stats.cursor)
-                        .map(|value| {
-                            if channel.unit.is_empty() {
-                                format!("{value:.2}")
-                            } else {
-                                format!("{value:.2} {}", channel.unit)
-                            }
-                        })
-                        .unwrap_or_else(|| "No data".to_owned());
-                    ui::scope_legend::Entry {
-                        channel_index: index,
-                        label: if channel.is_derived {
-                            format!("ƒ {}", ui::scope_legend::short_label(channel))
-                        } else {
-                            ui::scope_legend::short_label(channel).to_owned()
-                        },
-                        signal_id: channel.signal_id.clone(),
-                        value: Some(value),
-                        color: channel.color,
-                        style: egui_plot::LineStyle::Solid,
-                        stats,
-                        visible: !self.hidden_channels.contains(&channel.signal_id),
-                    }
-                })
-                .collect()
-        };
-
-        let plot = egui_plot::Plot::new(plot_id)
-            .custom_y_axes(y_axes)
-            .width(plot_width)
-            .height(plot_height)
-            .allow_zoom(false)
-            .allow_drag(false)
-            .allow_scroll(false)
-            .allow_boxed_zoom(false)
-            .allow_double_click_reset(false)
-            .x_axis_formatter(move |mark, _| match (is_comparison, x_axis_mode) {
-                (_, ScopeXAxisMode::TrackDistance) => format!("{:.0} m", mark.value),
-                (true, _) | (false, ScopeXAxisMode::ElapsedTime) => format!("{:.1}s", mark.value),
-                (false, ScopeXAxisMode::UtcTime) => {
-                    let offset_ms = (mark.value * 1000.0).round() as i64;
-                    start.offset(offset_ms).label()
-                }
-            });
-        // Temporary visibility does not invalidate samples or rescale the axes.
-        let channel_visible: Vec<bool> = self
-            .channels
-            .iter()
-            .map(|channel| !self.hidden_channels.contains(&channel.signal_id))
-            .collect();
-        let traces_per_channel = if is_comparison {
-            comparison_annotations.len()
-        } else {
-            1
-        };
-        let plot_response = plot.show(ui, |plot_ui| {
-            plot_ui.set_plot_bounds_x(0.0..=max_x_bound);
-            plot_ui.set_plot_bounds_y(active_y_min..=active_y_max);
-
-            for (index, trace) in cached.mapped_traces.iter().enumerate() {
-                if !channel_visible
-                    .get(index / traces_per_channel)
-                    .copied()
-                    .unwrap_or(true)
-                {
-                    continue;
-                }
-                let fill_color = trace.color.gamma_multiply(0.22);
-                let band_stroke =
-                    eframe::egui::Stroke::new(0.5_f32, trace.color.gamma_multiply(0.35));
-
-                for quad in &trace.envelope_bands {
-                    plot_ui.polygon(
-                        egui_plot::Polygon::new("", quad.to_vec())
-                            .fill_color(fill_color)
-                            .stroke(band_stroke)
-                            .allow_hover(false),
-                    );
-                }
-
-                plot_ui.line(
-                    egui_plot::Line::new(
-                        trace.name.clone(),
-                        egui_plot::PlotPoints::from(trace.mean_points.clone()),
-                    )
-                    .color(trace.color)
-                    .style(trace.style),
-                );
-            }
-
-            if let Some(px) = playhead_x {
-                plot_ui.vline(
-                    egui_plot::VLine::new("", px)
-                        .color(eframe::egui::Color32::YELLOW)
-                        .width(1.5_f32),
-                );
-            }
-
-            if let Some(hx) = hover_x
-                && hx >= 0.0
-                && hx <= max_x_bound
-            {
-                plot_ui.vline(
-                    egui_plot::VLine::new("", hx)
-                        .color(eframe::egui::Color32::from_rgba_unmultiplied(
-                            180, 235, 255, 210,
-                        ))
-                        .style(egui_plot::LineStyle::dashed_dense()),
-                );
-            }
-
-            let legend_interaction = show_legend
-                && ui::scope_legend::bounds(
-                    *plot_ui.transform().frame(),
-                    legend_entries.len(),
-                    show_statistics,
-                )
-                .is_some_and(|rect| {
-                    plot_ui.ctx().input(|input| {
-                        input
-                            .pointer
-                            .hover_pos()
-                            .is_some_and(|pos| rect.contains(pos))
-                            || input
-                                .pointer
-                                .press_origin()
-                                .is_some_and(|pos| rect.contains(pos))
-                    })
-                });
-            // Keep a wheel gesture owned by the legend through its smoothed tail.
-            let scrolling = plot_ui
-                .ctx()
-                .input(|input| input.smooth_scroll_delta != eframe::egui::Vec2::ZERO);
-            let scroll_id =
-                eframe::egui::Id::new(("scope_legend_scroll_capture", self.instance_num));
-            let legend_scroll_captured = plot_ui.ctx().data_mut(|data| {
-                let captured = scrolling
-                    && (legend_interaction || data.get_temp::<bool>(scroll_id).unwrap_or(false));
-                data.insert_temp(scroll_id, captured);
-                captured
-            });
-            let popup_open = eframe::egui::Popup::is_any_open(plot_ui.ctx()) || legend_interaction;
-            let mut pointer_utc_ms: Option<i64> = None;
-            let mut pointer_plot_y: Option<f64> = None;
-            if !popup_open
-                && plot_ui.response().hovered()
-                && let Some(coord) = plot_ui.pointer_coordinate()
-            {
-                pointer_plot_y = Some(coord.y);
-                let clamped_x = coord.x.clamp(0.0, max_x_bound);
-                match x_axis_mode {
-                    ScopeXAxisMode::TrackDistance => {
-                        view.set_hover_distance_m(Some(clamped_x));
-                        if let Some((_, ts, ds)) = &cached.primary_distance_lookup
-                            && let Some(utc_ms) = interpolate_ms_at_distance(ts, ds, clamped_x)
-                        {
-                            view.set_hover_utc_ms(Some(utc_ms));
-                            pointer_utc_ms = Some(utc_ms);
-                            if plot_ui.response().clicked() {
-                                view.request_setpoint_utc_ms(utc_ms);
-                            }
-                        }
-                    }
-                    ScopeXAxisMode::UtcTime | ScopeXAxisMode::ElapsedTime => {
-                        let ref_start_ms = if is_comparison {
-                            comparison_annotations
-                                .first()
-                                .map_or(start_ms, |a| a.start_utc_ms)
-                        } else {
-                            start_ms
-                        };
-                        let utc_ms = ref_start_ms + (clamped_x * 1000.0).round() as i64;
-                        view.set_hover_utc_ms(Some(utc_ms));
-                        pointer_utc_ms = Some(utc_ms);
-                        if plot_ui.response().clicked() {
-                            view.request_setpoint_utc_ms(utc_ms);
-                        }
-                    }
-                }
-            }
-
-            // Double-clicking on Scope resets ONLY the Y-axis range to fit the locally
-            // selected window; it never changes the MasterTimeline X range.
-            if !popup_open && plot_ui.response().double_clicked() {
-                next_y_override = None;
-                plot_ui.set_plot_bounds_y(primary_min..=primary_max);
-            }
-
-            if !is_comparison && !popup_open {
-                let span_ms = (end_ms - start_ms).max(daqcore::timeline::MIN_WINDOW_MS) as f64;
-                let anchor_ms = pointer_utc_ms.unwrap_or_else(|| view.timeline.setpoint_utc_ms());
-
-                if plot_ui.response().hovered() && !legend_scroll_captured {
-                    let (scroll, zoom_delta, shift_held) = plot_ui
-                        .ctx()
-                        .input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.modifiers.shift));
-                    if shift_held && scroll.y != 0.0 {
-                        let factor = ui::scroll_zoom_factor(scroll.y);
-                        let y_lo = active_y_min.min(active_y_max);
-                        let y_hi = active_y_max.max(y_lo);
-                        let cur_span = (y_hi - y_lo).max(1e-6);
-                        let new_span = (cur_span * factor).clamp(1e-4, 1e9);
-                        let anchor_y = pointer_plot_y
-                            .unwrap_or((y_lo + y_hi) * 0.5)
-                            .clamp(y_lo, y_hi);
-                        let ratio = (anchor_y - y_lo) / cur_span;
-                        let new_lo = anchor_y - ratio * new_span;
-                        next_y_override = Some((new_lo, new_lo + new_span));
-                    } else if (zoom_delta - 1.0).abs() > 1e-3 {
-                        let factor = (1.0 / f64::from(zoom_delta)).clamp(0.25, 4.0);
-                        view.request_zoom_around_ms(anchor_ms, factor);
-                    } else if scroll.y != 0.0 {
-                        let factor = ui::scroll_zoom_factor(scroll.y);
-                        view.request_zoom_around_ms(anchor_ms, factor);
-                    }
-                    if scroll.x.abs() > 0.5 {
-                        let delta_ms =
-                            (-(scroll.x as f64) / (plot_width as f64) * span_ms).round() as i64;
-                        view.request_pan_delta_ms(delta_ms);
-                    }
-                }
-
-                let plot_rect = plot_ui.response().rect;
-                let drag_dx = if plot_ui
-                    .response()
-                    .dragged_by(eframe::egui::PointerButton::Primary)
-                {
-                    plot_ui.response().drag_delta().x
-                } else if plot_ui.response().hovered() {
-                    plot_ui.ctx().input(|i| {
-                        if i.pointer.primary_down()
-                            && i.pointer
-                                .press_origin()
-                                .is_some_and(|origin| plot_rect.contains(origin))
-                        {
-                            i.pointer.delta().x
-                        } else {
-                            0.0
-                        }
-                    })
-                } else {
-                    0.0
-                };
-                if drag_dx.abs() > 0.0 {
-                    let delta_ms =
-                        (-(drag_dx as f64) / (plot_width as f64) * span_ms).round() as i64;
-                    view.request_pan_delta_ms(delta_ms);
-                }
-            }
-        });
-        self.y_bounds_override = next_y_override;
-        if show_legend
-            && let Some(rect) = ui::scope_legend::bounds(
-                *plot_response.transform.frame(),
-                legend_entries.len(),
-                show_statistics,
-            )
-            && let Some(action) = ui::scope_legend::show(
-                ui,
-                rect,
-                self.instance_num,
-                &legend_entries,
-                show_statistics,
-            )
-        {
-            match action {
-                ui::scope_legend::Action::Remove(index) => self.remove_channel(index),
-                ui::scope_legend::Action::Toggle(index) => self.toggle_channel_visibility(index),
-            }
-        }
-
-        egui_tiles::UiResponse::None
+        self.render_plots(ui, view, &comparison_annotations, &channel_stats)
     }
 }
 

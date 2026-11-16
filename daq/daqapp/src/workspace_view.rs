@@ -13,6 +13,8 @@ pub struct WorkspaceDataView<'a> {
     hover_distance_m: Cell<Option<f64>>,
     requested_setpoint_utc_ms: Cell<Option<i64>>,
     requested_zoom: Cell<Option<(i64, f64)>>,
+    requested_range_ms: Cell<Option<(i64, i64)>>,
+    requested_pause: Cell<bool>,
     requested_pan_delta_ms: Cell<Option<i64>>,
     hover_touched: Cell<bool>,
 }
@@ -40,6 +42,8 @@ impl<'a> WorkspaceDataView<'a> {
             hover_distance_m: Cell::new(hover_distance_m),
             requested_setpoint_utc_ms: Cell::new(None),
             requested_zoom: Cell::new(None),
+            requested_range_ms: Cell::new(None),
+            requested_pause: Cell::new(false),
             requested_pan_delta_ms: Cell::new(None),
             hover_touched: Cell::new(false),
         }
@@ -104,6 +108,26 @@ impl<'a> WorkspaceDataView<'a> {
     /// Pending timeline zoom `(anchor_utc_ms, zoom_factor)` requested during this render pass.
     pub fn requested_zoom(&self) -> Option<(i64, f64)> {
         self.requested_zoom.get()
+    }
+
+    pub fn request_pause(&self) {
+        self.requested_pause.set(true);
+    }
+
+    pub fn requested_pause(&self) -> bool {
+        self.requested_pause.get()
+    }
+
+    /// Select an exact shared time window without introducing a local plot viewport.
+    pub fn request_range_ms(&self, start: i64, end: i64) {
+        let (start, end) = (start.min(end), start.max(end));
+        if end.saturating_sub(start) >= daqcore::timeline::MIN_WINDOW_MS {
+            self.requested_range_ms.set(Some((start, end)));
+        }
+    }
+
+    pub fn requested_range_ms(&self) -> Option<(i64, i64)> {
+        self.requested_range_ms.get()
     }
 
     /// Request panning the global Master Timeline `[start, end]` by `delta_ms`.

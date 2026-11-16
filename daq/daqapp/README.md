@@ -38,6 +38,16 @@ DaqApp is PER's complete trackside data acquisition and analysis desktop applica
 
 Sidebar settings (source, SuperDBC, etc) are saved to a local settings file to persist between sessions.
 
+## Scope graphs
+
+- Click the plot to move the shared playhead. Left drag selects a time range and zooms the shared timeline to it. Escape cancels the selection.
+- Right drag pans the shared window. Scroll zooms time, Shift scroll zooms Y, and double click resets the local Y zoom.
+- The legend icon toggles the bottom left overlay. Eye icons temporarily hide signals without deleting them or changing their colors.
+- Click a legend entry, then **Appearance**, **Assignment**, or **Axis** to open its settings. Configure color, opacity, width, lines, points, stepped rendering, plot assignment, and independent Auto or Fixed axes.
+- The stacked plots icon splits signals into aligned lanes. Drag a legend color swatch into another plot to move that signal. The scope menu also contains plot count and layout controls.
+- The measurement icon enables A and B cursors. Click twice to pin them, then drag either cursor line. The plots show the time difference and legends show signal differences. Missing or offscreen measurements are not interpolated across gaps.
+- Appearance, axes, and lane assignments are stored in workspace presets. Temporary visibility and measurement cursors are session state.
+
 ## Getting started
 
 Install Rust/Cargo and the platform prerequisites described in the repository

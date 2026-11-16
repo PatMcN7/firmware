@@ -166,6 +166,8 @@ pub enum PaneSpec {
         speed_signal_id: String,
         #[serde(default = "default_true")]
         show_legend: bool,
+        #[serde(default)]
+        plot: ui::scope_settings::ScopeConfig,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         y_bounds: Option<[f64; 2]>,
         #[serde(default)]
@@ -731,6 +733,7 @@ fn capture_widget_spec(widget: &widgets::Widget) -> PaneSpec {
                 x_mode: scope.x_axis_mode,
                 speed_signal_id: scope.speed_signal_id.clone(),
                 show_legend: scope.show_legend,
+                plot: scope.config.clone(),
                 y_bounds,
                 channels,
                 axes: Vec::new(),
@@ -889,6 +892,7 @@ fn instantiate_pane_spec(
             x_mode,
             speed_signal_id,
             show_legend,
+            plot,
             y_bounds,
             channels,
             axes,
@@ -962,6 +966,26 @@ fn instantiate_pane_spec(
                 y_bounds_override,
             );
             scope.show_legend = *show_legend;
+            scope.config = plot.clone();
+            // Honor existing shorthand axis assignments as well as new plot settings.
+            for axis in axes {
+                let base = if axis.id.is_empty() {
+                    &axis.unit
+                } else {
+                    &axis.id
+                };
+                for signal in &axis.signals {
+                    let signal = daqcore::analysis::canonicalize_signal_ref(signal);
+                    scope.config.channels.entry(signal).or_default().axis = base.clone();
+                }
+                let settings = scope.config.axes.entry(format!("0|{base}")).or_default();
+                settings.side = match axis.position.as_str() {
+                    "left" => ui::scope_settings::AxisSide::Left,
+                    "right" => ui::scope_settings::AxisSide::Right,
+                    _ => settings.side,
+                };
+            }
+            scope.config.sanitize();
             widgets::Widget::Scope(scope)
         }
         PaneSpec::StateLane {
@@ -1534,6 +1558,65 @@ mod tests {
             restored.show_legend,
             "Older workspaces keep the legend visible"
         );
+    }
+
+    #[test]
+    fn scope_styles_axes_and_stacked_layout_survive_workspace_reload() {
+        use ui::scope_settings::{AxisConfig, AxisSide, SignalStyle, TraceMode};
+        let mut scope = ui::scope::Scope::new_multi(
+            1,
+            "Styled",
+            vec![(
+                "message.signal".to_owned(),
+                "Signal".to_owned(),
+                "V".to_owned(),
+            )],
+        );
+        scope.config.stacked = true;
+        scope.config.lanes = 3;
+        scope.config.channels.insert(
+            "message.signal".to_owned(),
+            SignalStyle {
+                width: 3.5,
+                opacity: 0.4,
+                mode: TraceMode::Steps,
+                points: true,
+                lane: 2,
+                axis: "Independent".to_owned(),
+                ..Default::default()
+            },
+        );
+        scope.config.axes.insert(
+            "2|Independent".to_owned(),
+            AxisConfig {
+                range: Some([100.0, 600.0]),
+                side: AxisSide::Right,
+                color: Some([220, 30, 90]),
+                label: "Voltage".to_owned(),
+            },
+        );
+        let expected = scope.config.clone();
+        let spec = capture_widget_spec(&widgets::Widget::Scope(scope));
+        let json = serde_json::to_string(&spec).unwrap();
+        let restored: PaneSpec = serde_json::from_str(&json).unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let widget =
+            instantiate_pane_spec(&restored, &mut widget_ids::WidgetIds::new(), tx.clone());
+        let widgets::Widget::Scope(scope) = widget else {
+            panic!("Expected scope");
+        };
+        assert_eq!(scope.config, expected);
+        let mut legacy = serde_json::to_value(restored).unwrap();
+        legacy.as_object_mut().unwrap().remove("plot");
+        let widget = instantiate_pane_spec(
+            &serde_json::from_value(legacy).unwrap(),
+            &mut widget_ids::WidgetIds::new(),
+            tx,
+        );
+        let widgets::Widget::Scope(scope) = widget else {
+            panic!("Expected scope");
+        };
+        assert_eq!(scope.config, ui::scope_settings::ScopeConfig::default());
     }
 
     #[test]

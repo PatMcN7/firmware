@@ -5,6 +5,7 @@ use crate::ui::{
 };
 use eframe::egui::{self, Color32, Rect, Stroke};
 
+#[derive(Clone)]
 pub(super) struct Entry {
     pub channel_index: usize,
     pub label: String,
@@ -14,11 +15,19 @@ pub(super) struct Entry {
     pub style: egui_plot::LineStyle,
     pub stats: Option<ChannelStats>,
     pub visible: bool,
+    pub measurements: Option<(f64, f64)>,
+}
+
+#[derive(Clone)]
+pub(super) struct SignalDrag {
+    pub scope: usize,
+    pub signal: String,
 }
 
 pub(super) enum Action {
     Remove(usize),
     Toggle(usize),
+    Inspect(usize, ui::scope_settings::InspectorTab),
 }
 
 pub(super) fn toggle_button(ui: &mut egui::Ui, visible: bool) -> egui::Response {
@@ -81,6 +90,7 @@ pub(super) fn show(
     instance: usize,
     entries: &[Entry],
     statistics: bool,
+    scope_instance: usize,
 ) -> Option<Action> {
     let theme = ui::theme::get_theme(ui.ctx());
     let mut action = None;
@@ -148,6 +158,20 @@ pub(super) fn show(
                                 if eye_response.clicked() {
                                     action = Some(Action::Toggle(entry.channel_index));
                                 }
+                                let swatch = Rect::from_min_size(
+                                    row.left_top(),
+                                    egui::vec2(18.0, row.height()),
+                                );
+                                ui.interact(
+                                    swatch,
+                                    ui.id().with(("signal_drag", index)),
+                                    egui::Sense::drag(),
+                                )
+                                .on_hover_text("Drag signal between plots")
+                                .dnd_set_drag_payload(SignalDrag {
+                                    scope: scope_instance,
+                                    signal: entry.signal_id.clone(),
+                                });
                                 let value_right = eye_rect.left() - 5.0;
                                 paint_swatch(
                                     ui,
@@ -211,6 +235,16 @@ pub(super) fn show(
                                 let response = response.on_hover_text("Channel details");
                                 egui::Popup::menu(&response)
                                     .id(ui.id().with(("channel_details", index)))
+                                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                                    .info(
+                                        egui::UiStackInfo::new(egui::UiKind::Menu).with_tag_value(
+                                            egui::containers::menu::MenuConfig::MENU_CONFIG_TAG,
+                                            egui::containers::menu::MenuConfig::new()
+                                                .close_behavior(
+                                                    egui::PopupCloseBehavior::CloseOnClickOutside,
+                                                ),
+                                        ),
+                                    )
                                     .show(|ui| {
                                         ui.label(&entry.signal_id);
                                         if let Some(stats) = entry.stats {
@@ -226,6 +260,28 @@ pub(super) fn show(
                                                         ui.end_row();
                                                     }
                                                 });
+                                        }
+                                        for (label, tab) in [
+                                            (
+                                                "Appearance",
+                                                ui::scope_settings::InspectorTab::Appearance,
+                                            ),
+                                            (
+                                                "Assignment",
+                                                ui::scope_settings::InspectorTab::Assignment,
+                                            ),
+                                            ("Axis", ui::scope_settings::InspectorTab::Axis),
+                                        ] {
+                                            if ui.button(label).clicked() {
+                                                action =
+                                                    Some(Action::Inspect(entry.channel_index, tab));
+                                                ui.close();
+                                            }
+                                        }
+                                        if let Some((a, b)) = entry.measurements {
+                                            ui.label(format!("A ({a:.3})"));
+                                            ui.label(format!("B ({b:.3})"));
+                                            ui.label(format!("Δ ({:.3})", b - a));
                                         }
                                         if ui.button("Remove signal").clicked() {
                                             action = Some(Action::Remove(entry.channel_index));
@@ -338,6 +394,7 @@ mod tests {
                     style: egui_plot::LineStyle::Solid,
                     stats: None,
                     visible: true,
+                    measurements: None,
                 })
                 .collect();
             let rect = bounds(plot, rows, false).unwrap();
@@ -354,7 +411,7 @@ mod tests {
                     },
                     |ctx| {
                         egui::CentralPanel::default().show(ctx, |ui| {
-                            show(ui, rect, rows, &entries, false);
+                            show(ui, rect, rows, &entries, false, rows);
                         });
                     },
                 );

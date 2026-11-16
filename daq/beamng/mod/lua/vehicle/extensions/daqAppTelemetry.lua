@@ -46,6 +46,15 @@ local function put(values, key, value)
   end
 end
 
+local function tireTemperature(method, wheelID)
+  if not method or wheelID == nil then return nil end
+  local ok, kelvin = pcall(method, obj, wheelID)
+  if ok and type(kelvin) == 'number' and kelvin > 0 and kelvin < math.huge then
+    return kelvin - 273.15
+  end
+  return nil
+end
+
 local function collect()
   local values = {}
   local e = electrics.values
@@ -90,6 +99,10 @@ local function collect()
       put(values, prefix .. 'drive_torque_nm', wheel.propulsionTorque)
       put(values, prefix .. 'brake_temp_c', wheel.brakeSurfaceTemperature)
       put(values, prefix .. 'brake_core_temp_c', wheel.brakeCoreTemperature)
+      if wheel.hasTire ~= false then
+        put(values, prefix .. 'tire_avg_temp_c', tireTemperature(obj.getWheelAvgTemperature, wheel.wheelID))
+        put(values, prefix .. 'tire_core_temp_c', tireTemperature(obj.getWheelCoreTemperature, wheel.wheelID))
+      end
     end
   end
   return values

@@ -59,7 +59,10 @@ Definitions (including names, units, and descriptions) live in
 - Vehicle sensor acceleration (m/s²), world position/velocity, roll/pitch/yaw.
 - For wheels explicitly named **FL, FR, RL, RR**: wheel speed, angular velocity,
   smoothed normal load, longitudinal/lateral slip velocity, propulsion torque,
-  brake surface/core temperature.
+  brake surface/core temperature, and average/core **tire temperatures in °C**
+  (`wheel_FL_tire_avg_temp_c`, `wheel_FL_tire_core_temp_c`, and the FR/RL/RR
+  equivalents). Tire values come from BeamNG's wheel APIs (Kelvin converted to
+  Celsius); unavailable values and tireless wheels are omitted.
 
 These wheel channels go beyond OutGauge. Vehicle-specific or unavailable fields
 are **omitted**, not reported as zero. Custom wheel names/multi-axle vehicles need

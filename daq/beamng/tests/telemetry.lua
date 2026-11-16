@@ -31,7 +31,7 @@ electrics = {values = {rpm = 4500, wheelspeed = 20, throttle = 0.5,
   gearIndex = -1, steering_input = -0.25, brake = 0, oiltemp = 0/0}}
 sensors = {gx = 1.2, gy = -2.4, gz = 9.81}
 wheels = {wheels = {
-  [0] = {name = 'FL', wheelSpeed = 21, angularVelocity = 60, downForce = 3200,
+  [0] = {name = 'FL', wheelID = 0, hasTire = true, wheelSpeed = 21, angularVelocity = 60, downForce = 3200,
     lastSlip = 0.5, lastSideSlip = 0.2, propulsionTorque = 150,
     brakeSurfaceTemperature = 140, brakeCoreTemperature = 100},
   [1] = {name = 'custom_axle', downForce = 9000}
@@ -41,7 +41,9 @@ obj = {
   getVelocity = function() return {x = 20, y = 0, z = 0, length = function() return 20 end} end,
   getPositionXYZ = function() return 100, 200, 3 end,
   getRollPitchYaw = function() return 0.1, 0.2, 0.3 end,
-  getID = function() return 42 end
+  getID = function() return 42 end,
+  getWheelAvgTemperature = function(_, id) assert(id == 0); return 353.15 end,
+  getWheelCoreTemperature = function(_, id) assert(id == 0); return 343.15 end
 }
 local telemetry = dofile(mod .. 'lua/vehicle/extensions/daqAppTelemetry.lua')
 assert(not telemetry.start(0, 30))
@@ -53,6 +55,8 @@ telemetry.updateGFX(1/60)
 assert(#sent == 1 and lastPacket.version == 1)
 assert(lastPacket.signals.rpm == 4500 and lastPacket.signals.gear == -1)
 assert(lastPacket.signals.wheel_FL_load_n == 3200)
+assert(math.abs(lastPacket.signals.wheel_FL_tire_avg_temp_c - 80) < 1e-6)
+assert(math.abs(lastPacket.signals.wheel_FL_tire_core_temp_c - 70) < 1e-6)
 assert(lastPacket.signals.wheel_FR_load_n == nil)
 assert(lastPacket.signals.oil_temp_c == nil) -- NaN omitted
 assert(lastPacket.signals.clutch == nil) -- unavailable, not a made-up zero
@@ -65,12 +69,28 @@ telemetry.updateGFX(0)
 assert(#sent == 1)
 telemetry.updateGFX(1) -- slow frame sends only one packet, never catch-up bursts
 assert(#sent == 2)
+-- Unavailable APIs, invalid values, and tireless wheels never become fake temperatures.
+obj.getWheelAvgTemperature = nil
+obj.getWheelCoreTemperature = function() return 0 end
 telemetry.onReset()
 telemetry.updateGFX(0.04)
+assert(lastPacket.signals.wheel_FL_tire_avg_temp_c == nil)
+assert(lastPacket.signals.wheel_FL_tire_core_temp_c == nil)
 assert(lastPacket.sequence == 1 and lastPacket.sim_time == 0.04)
+obj.getWheelAvgTemperature = function() error('unavailable on this vehicle') end
+obj.getWheelCoreTemperature = function() return 0/0 end
+telemetry.updateGFX(0.04)
+assert(lastPacket.signals.wheel_FL_tire_avg_temp_c == nil)
+assert(lastPacket.signals.wheel_FL_tire_core_temp_c == nil)
+wheels.wheels[0].hasTire = false
+obj.getWheelAvgTemperature = function() error('must not query a tireless wheel') end
+obj.getWheelCoreTemperature = obj.getWheelAvgTemperature
+telemetry.updateGFX(0.04)
+assert(lastPacket.signals.wheel_FL_tire_avg_temp_c == nil)
+assert(lastPacket.signals.wheel_FL_tire_core_temp_c == nil)
 telemetry.onExtensionUnloaded()
 telemetry.updateGFX(1)
-assert(#sent == 3 and closed == 1)
+assert(#sent == 5 and closed == 1)
 
 -- GE loader follows vehicle switches/respawns and tears down the old sender.
 local queue = {}

@@ -65,14 +65,14 @@ fn udp_to_worker_to_plot_history() {
     let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
     let packet = serde_json::json!({"protocol": beamng::PROTOCOL, "version": 1,
         "vehicle_id": 42, "sequence": 3, "sim_time": 2.0,
-        "signals": {"speed_mps": 27.5, "wheel_FL_load_n": 3200}})
+        "signals": {"speed_mps": 27.5, "wheel_FL_load_n": 3200, "wheel_FL_tire_avg_temp_c": 80}})
     .to_string();
     sender.send_to(b"malformed", address).unwrap();
     sender.send_to(packet.as_bytes(), address).unwrap();
     let mut router =
         daqcore::router::VirtualTimelineRouter::live(daqcore::time::Time::now(), 30.0).unwrap();
     let mut received = 0;
-    while received < 5 {
+    while received < 6 {
         match events
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
             .unwrap()
@@ -85,6 +85,9 @@ fn udp_to_worker_to_plot_history() {
                 if let Some(value) = decoded.signal("wheel_FL_load_n") {
                     assert_eq!(value.physical(), 3200.0);
                 }
+                if let Some(value) = decoded.signal("wheel_FL_tire_avg_temp_c") {
+                    assert_eq!(value.physical(), 80.0);
+                }
                 router.ingest_frame(frame);
                 received += 1;
             }
@@ -92,6 +95,6 @@ fn udp_to_worker_to_plot_history() {
             _ => {}
         }
     }
-    assert_eq!(router.live_buffer().latest_map().len(), 5);
+    assert_eq!(router.live_buffer().latest_map().len(), 6);
     worker.stop().unwrap();
 }

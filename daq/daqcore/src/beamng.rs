@@ -214,6 +214,46 @@ pub const SIGNALS: &[(&str, &str, &str)] = &[
         "degC",
         "RR brake core temperature",
     ),
+    (
+        "wheel_FL_tire_avg_temp_c",
+        "degC",
+        "FL average tire temperature, converted from Kelvin",
+    ),
+    (
+        "wheel_FL_tire_core_temp_c",
+        "degC",
+        "FL tire core temperature, converted from Kelvin",
+    ),
+    (
+        "wheel_FR_tire_avg_temp_c",
+        "degC",
+        "FR average tire temperature, converted from Kelvin",
+    ),
+    (
+        "wheel_FR_tire_core_temp_c",
+        "degC",
+        "FR tire core temperature, converted from Kelvin",
+    ),
+    (
+        "wheel_RL_tire_avg_temp_c",
+        "degC",
+        "RL average tire temperature, converted from Kelvin",
+    ),
+    (
+        "wheel_RL_tire_core_temp_c",
+        "degC",
+        "RL tire core temperature, converted from Kelvin",
+    ),
+    (
+        "wheel_RR_tire_avg_temp_c",
+        "degC",
+        "RR average tire temperature, converted from Kelvin",
+    ),
+    (
+        "wheel_RR_tire_core_temp_c",
+        "degC",
+        "RR tire core temperature, converted from Kelvin",
+    ),
 ];
 
 /// Exportable definitions for decoding both live data and recorded synthetic frames.

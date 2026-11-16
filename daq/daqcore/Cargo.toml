@@ -11,6 +11,11 @@ diesel_migrations.workspace = true
 libsqlite3-sys.workspace = true
 sha2.workspace = true
 uuid.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
 chrono.workspace = true
 log.workspace = true
 bytemuck.workspace = true
@@ -29,4 +34,7 @@ typify = { version = "=0.8.0", default-features = false }
 serde_json.workspace = true
 syn = { version = "2", features = ["full"] }
 prettyplease = "0.2"
+tempfile = "3"
+
+[dev-dependencies]
 tempfile = "3"

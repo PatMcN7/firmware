@@ -11,9 +11,9 @@ pub use tile_cache::{
     read_single_signal_full_res, read_single_signal_overview,
 };
 pub use types::{
-    BUCKET_1HZ_MS, BUCKET_10HZ_MS, ClockProvenance, CoverageSpan, DataSourceKind, EnvelopePoint,
-    OVERVIEW_1HZ_THRESHOLD_MS, OVERVIEW_10HZ_THRESHOLD_MS, Resolution, SignalSeries, StateInterval,
-    build_envelope_buckets,
+    ActiveSignalMeta, BUCKET_1HZ_MS, BUCKET_10HZ_MS, ClockProvenance, CoverageSpan, DataSourceKind,
+    EnvelopePoint, OVERVIEW_1HZ_THRESHOLD_MS, OVERVIEW_10HZ_THRESHOLD_MS, Resolution, SignalSeries,
+    StateInterval, build_envelope_buckets,
 };
 
 use crate::{
@@ -22,11 +22,28 @@ use crate::{
         map_series_to_distance,
     },
     frame::ParsedFrame,
-    storage::{Annotation, PartitionManifest, RegisteredPartition, Registry, TrackDay},
+    storage::{
+        Annotation, CloudSyncEvent, CloudSyncHandle, CloudSyncStatus, PartitionManifest,
+        RegisteredPartition, Registry, TrackDay,
+    },
     time::Time,
     timeline::MasterTimeline,
 };
-use std::{ops, path, time};
+use std::{collections::HashMap, io, ops, path, sync::Mutex, time};
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct QueryCacheKey {
+    signal_id: String,
+    start_ms: i64,
+    end_ms: i64,
+    resolution: Resolution,
+}
+
+#[derive(Default)]
+struct QuerySignalCache {
+    revision: u64,
+    entries: HashMap<QueryCacheKey, SignalSeries>,
+}
 
 /// Unified timeline router combining canonical SD Parquet partitions (`TileCache` + `Registry`)
 /// with provisional live CAN traffic (`LiveColumnBuffer`) on a single `utc_ms` coordinate axis.
@@ -45,6 +62,12 @@ pub struct VirtualTimelineRouter {
     partitions: Vec<RegisteredPartition>,
     timeline: MasterTimeline,
     formula_engine: FormulaEngine,
+    router_revision: u64,
+    query_cache: Mutex<QuerySignalCache>,
+    cached_track_days: Mutex<Option<Vec<TrackDay>>>,
+    cached_annotations: Mutex<Option<Vec<Annotation>>>,
+    cloud_sync: Option<CloudSyncHandle>,
+    repaint_cb: Mutex<Option<RepaintCallback>>,
 }
 
 impl VirtualTimelineRouter {
@@ -60,6 +83,12 @@ impl VirtualTimelineRouter {
             partitions: Vec::new(),
             timeline,
             formula_engine: FormulaEngine::with_builtin_config(),
+            router_revision: 1,
+            query_cache: Mutex::new(QuerySignalCache::default()),
+            cached_track_days: Mutex::new(None),
+            cached_annotations: Mutex::new(None),
+            cloud_sync: None,
+            repaint_cb: Mutex::new(None),
         })
     }
 
@@ -81,9 +110,32 @@ impl VirtualTimelineRouter {
             partitions: Vec::new(),
             timeline,
             formula_engine: FormulaEngine::with_builtin_config(),
+            router_revision: 1,
+            query_cache: Mutex::new(QuerySignalCache::default()),
+            cached_track_days: Mutex::new(None),
+            cached_annotations: Mutex::new(None),
+            cloud_sync: None,
+            repaint_cb: Mutex::new(None),
         };
         router.refresh_store()?;
         Ok(router)
+    }
+
+    /// Monotonically increasing revision counter that increments whenever partitions,
+    /// background tiles, live frames, formulas, or annotations change.
+    pub fn data_revision(&self) -> u64 {
+        self.router_revision
+            .wrapping_add(self.tile_cache.revision())
+    }
+
+    fn invalidate_metadata_cache(&mut self) {
+        self.router_revision = self.router_revision.wrapping_add(1);
+        if let Ok(mut guard) = self.cached_track_days.lock() {
+            *guard = None;
+        }
+        if let Ok(mut guard) = self.cached_annotations.lock() {
+            *guard = None;
+        }
     }
 
     /// Attach or switch to a new on-disk store directory and preload its local partitions.
@@ -96,6 +148,7 @@ impl VirtualTimelineRouter {
         self.registry = registry;
         self.store_dir = Some(store_dir);
         self.tile_cache.clear();
+        self.invalidate_metadata_cache();
         self.refresh_store()
     }
 
@@ -103,11 +156,30 @@ impl VirtualTimelineRouter {
     /// partition list, preload any new `overview_1hz.parquet` and `states.parquet` files into
     /// `TileCache`, and update `MasterTimeline` day bounds.
     pub fn refresh_store(&mut self) -> Result<usize, RouterError> {
+        self.invalidate_metadata_cache();
         let Some(store_dir) = self.store_dir.clone() else {
             return Ok(0);
         };
         let _ = self.registry.sync_from_store_dir(&store_dir)?;
+        let newly_preloaded = self.reload_registry_state()?;
+        if let Some(sync) = &self.cloud_sync {
+            sync.trigger_upload();
+        }
+        Ok(newly_preloaded)
+    }
+
+    /// Reload track days and partitions from `local_registry.sqlite`, preload any new
+    /// `overview_1hz.parquet` / `states.parquet` files into `TileCache`, and update timeline day bounds.
+    pub fn reload_registry_state(&mut self) -> Result<usize, RouterError> {
+        self.invalidate_metadata_cache();
+        let Some(store_dir) = self.store_dir.clone() else {
+            return Ok(0);
+        };
+        let had_bounds = self.timeline.day_bounds_ms().is_some();
         let days = self.registry.list_track_days()?;
+        if let Ok(mut guard) = self.cached_track_days.lock() {
+            *guard = Some(days.clone());
+        }
         let mut all_partitions = Vec::new();
         for day in &days {
             let mut day_parts = self.registry.list_partitions_for_day(&day.id)?;
@@ -123,15 +195,40 @@ impl VirtualTimelineRouter {
             .tile_cache
             .preload_registered_partitions(&store_dir, &all_partitions)?;
 
-        for part in &all_partitions {
-            self.timeline
-                .observe_day_span_ms(part.start_utc_ms, part.end_utc_ms);
-        }
-        if self.timeline.active_track_day_id().is_none()
+        let active_missing = self
+            .timeline
+            .active_track_day_id()
+            .is_some_and(|active_id| !days.iter().any(|d| d.id == active_id));
+        if (self.timeline.active_track_day_id().is_none() || active_missing)
             && let Some(last_day) = days.last()
         {
             self.timeline
                 .set_active_track_day_id(Some(last_day.id.clone()));
+            if let Some(sync) = &self.cloud_sync {
+                sync.set_active_track_day(Some(last_day.id.clone()));
+            }
+        }
+
+        let active_day_id = self.timeline.active_track_day_id().map(str::to_owned);
+        let mut min_ms: Option<i64> = None;
+        let mut max_ms: Option<i64> = None;
+        for part in &all_partitions {
+            if active_day_id
+                .as_deref()
+                .is_none_or(|day_id| part.track_day_id == day_id)
+            {
+                min_ms = Some(min_ms.map_or(part.start_utc_ms, |m| m.min(part.start_utc_ms)));
+                max_ms = Some(max_ms.map_or(part.end_utc_ms, |m| m.max(part.end_utc_ms)));
+            }
+        }
+        if let (Some(lo), Some(hi)) = (min_ms, max_ms) {
+            self.timeline.set_day_bounds_ms(Some((lo, hi.max(lo))));
+        }
+        if (!had_bounds || active_missing)
+            && self.live_buffer.is_empty()
+            && let Some((lo, hi)) = self.timeline.day_bounds_ms()
+        {
+            self.timeline.snap_to_range_ms(lo, hi);
         }
 
         self.partitions = all_partitions;
@@ -145,6 +242,7 @@ impl VirtualTimelineRouter {
         partition_dir: impl AsRef<path::Path>,
     ) -> Result<(), RouterError> {
         self.registry.register_manifest(manifest, true)?;
+        self.invalidate_metadata_cache();
         self.tile_cache.preload_partition(
             &manifest.partition_id,
             partition_dir.as_ref(),
@@ -165,12 +263,128 @@ impl VirtualTimelineRouter {
         if self.timeline.active_track_day_id().is_none() {
             self.timeline
                 .set_active_track_day_id(Some(manifest.track_day_id.clone()));
+            if let Some(sync) = &self.cloud_sync {
+                sync.set_active_track_day(Some(manifest.track_day_id.clone()));
+            }
+        }
+        if let Some(sync) = &self.cloud_sync {
+            sync.trigger_upload();
         }
         Ok(())
     }
 
     pub fn set_repaint_callback(&self, callback: Option<RepaintCallback>) {
-        self.tile_cache.set_repaint_callback(callback);
+        if let Ok(mut guard) = self.repaint_cb.lock() {
+            *guard = callback.clone();
+        }
+        self.tile_cache.set_repaint_callback(callback.clone());
+        if let Some(sync) = &self.cloud_sync {
+            sync.set_repaint_callback(callback);
+        }
+    }
+
+    /// Connect this router to a `daqcloud` server at `base_url` (e.g. `"http://127.0.0.1:3000"`).
+    /// Spawns a non-blocking background worker that syncs the catalog, prefetches `1 Hz` overviews
+    /// and states, uploads local SD partitions, and listens for live WebSocket updates.
+    pub fn connect_cloud(&mut self, base_url: impl Into<String>) -> Result<(), RouterError> {
+        let Some(store_dir) = self.store_dir.clone() else {
+            return Err(RouterError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Cannot connect to daqcloud without an attached store directory",
+            )));
+        };
+        if let Some(mut existing) = self.cloud_sync.take() {
+            existing.shutdown();
+        }
+        let repaint_cb = self.repaint_cb.lock().ok().and_then(|g| g.clone());
+        let active_day = self.timeline.active_track_day_id().map(str::to_owned);
+        let handle = CloudSyncHandle::spawn(base_url, store_dir, active_day, repaint_cb);
+        self.cloud_sync = Some(handle);
+        Ok(())
+    }
+
+    /// Disconnect from `daqcloud` and terminate the background sync worker.
+    pub fn disconnect_cloud(&mut self) {
+        if let Some(mut handle) = self.cloud_sync.take() {
+            handle.shutdown();
+        }
+    }
+
+    /// Return the current connection and sync status for `daqcloud`.
+    pub fn cloud_status(&self) -> CloudSyncStatus {
+        self.cloud_sync
+            .as_ref()
+            .map(CloudSyncHandle::status)
+            .unwrap_or(CloudSyncStatus::Disconnected)
+    }
+
+    /// Trigger an immediate catalog sync and local partition upload pass on the background worker.
+    pub fn trigger_cloud_sync(&self) {
+        if let Some(sync) = &self.cloud_sync {
+            sync.trigger_sync();
+        }
+    }
+
+    /// Request an on-demand download of `overview_10hz.parquet` + `full_res.parquet` for `partition_id`.
+    pub fn request_partition_download(&self, partition_id: &str) -> bool {
+        self.cloud_sync
+            .as_ref()
+            .is_some_and(|sync| sync.request_partition_download(partition_id))
+    }
+
+    /// Drain pending [`CloudSyncEvent`]s from the background worker, preload newly downloaded
+    /// `overview_1hz.parquet` / `states.parquet` files into `TileCache`, refresh localized
+    /// `is_local` flags, and trigger on-demand full-resolution downloads if the viewport is zoomed in.
+    pub fn poll_cloud_sync(&mut self) -> usize {
+        let events = match &self.cloud_sync {
+            Some(sync) => sync.drain_events(),
+            None => return 0,
+        };
+
+        let mut reload_partitions = false;
+        let mut invalidate_anns = false;
+        let count = events.len();
+
+        for ev in events {
+            match ev {
+                CloudSyncEvent::CatalogSynced { .. }
+                | CloudSyncEvent::OverviewDownloaded { .. }
+                | CloudSyncEvent::PartitionLocalized { .. } => {
+                    reload_partitions = true;
+                }
+                CloudSyncEvent::AnnotationsUpdated => {
+                    invalidate_anns = true;
+                }
+                CloudSyncEvent::PartitionUploaded { .. } | CloudSyncEvent::Error(_) => {}
+            }
+        }
+
+        if reload_partitions {
+            let _ = self.reload_registry_state();
+        } else if invalidate_anns {
+            self.invalidate_metadata_cache();
+        }
+
+        // If the active timeline viewport is zoomed into the 10Hz or FullRes regime, automatically
+        // request on-demand downloads for any overlapping remote partitions (`!part.is_local`).
+        if self.timeline.window_ms() <= OVERVIEW_1HZ_THRESHOLD_MS
+            && let Some(sync) = &self.cloud_sync
+        {
+            let win = self.timeline.range_ms();
+            let start_ms = *win.start();
+            let end_ms = *win.end();
+            for part in &self.partitions {
+                if !part.is_local && part.start_utc_ms <= end_ms && part.end_utc_ms >= start_ms {
+                    sync.request_partition_download(&part.partition_id);
+                }
+            }
+        }
+
+        count
+    }
+
+    fn is_partition_readable(&self, part: &RegisteredPartition) -> bool {
+        part.is_local || self.tile_cache.is_partition_preloaded(&part.partition_id)
     }
 
     pub fn store_dir(&self) -> Option<&path::Path> {
@@ -190,6 +404,7 @@ impl VirtualTimelineRouter {
     }
 
     pub fn live_buffer_mut(&mut self) -> &mut LiveColumnBuffer {
+        self.router_revision = self.router_revision.wrapping_add(1);
         &mut self.live_buffer
     }
 
@@ -198,6 +413,7 @@ impl VirtualTimelineRouter {
     }
 
     pub fn tile_cache_mut(&mut self) -> &mut TileCache {
+        self.router_revision = self.router_revision.wrapping_add(1);
         &mut self.tile_cache
     }
 
@@ -214,6 +430,7 @@ impl VirtualTimelineRouter {
     }
 
     pub fn formula_engine_mut(&mut self) -> &mut FormulaEngine {
+        self.router_revision = self.router_revision.wrapping_add(1);
         &mut self.formula_engine
     }
 
@@ -229,9 +446,20 @@ impl VirtualTimelineRouter {
         if range.is_empty() {
             return Ok(SignalSeries::empty_for(resolution));
         }
+        let raw_resolution = if self.formula_engine.plan_contains_series_fn(expr) {
+            if resolution == Resolution::FullRes
+                || range.end().saturating_sub(*range.start()) <= 30_000
+            {
+                Resolution::FullRes
+            } else {
+                Resolution::Overview10Hz
+            }
+        } else {
+            resolution
+        };
         self.formula_engine
             .evaluate_expr_with(expr, &TargetGrid::Union, resolution, |raw_id| {
-                self.query_raw_signal(raw_id, range.clone(), resolution)
+                self.query_raw_signal(raw_id, range.clone(), raw_resolution)
             })
     }
 
@@ -251,9 +479,15 @@ impl VirtualTimelineRouter {
             .execution_plan_for_expr(expr)
             .map_err(|e| RouterError::Io(io::Error::other(e.to_string())))?;
 
+        let raw_resolution = if self.formula_engine.plan_contains_series_fn(expr) {
+            Resolution::FullRes
+        } else {
+            resolution
+        };
+
         let mut prefetched = std::collections::BTreeMap::new();
         for raw_id in raw_ids {
-            let series = self.query_raw_signal_blocking(&raw_id, range.clone(), resolution)?;
+            let series = self.query_raw_signal_blocking(&raw_id, range.clone(), raw_resolution)?;
             prefetched.insert(raw_id, series);
         }
 
@@ -262,7 +496,7 @@ impl VirtualTimelineRouter {
                 prefetched
                     .get(raw_id)
                     .cloned()
-                    .unwrap_or_else(|| SignalSeries::empty_for(resolution))
+                    .unwrap_or_else(|| SignalSeries::empty_for(raw_resolution))
             })
             .map_err(|e| RouterError::Io(io::Error::other(e.to_string())))
     }
@@ -319,6 +553,7 @@ impl VirtualTimelineRouter {
     pub fn ingest_frame(&mut self, frame: ParsedFrame) -> bool {
         let timestamp = frame.timestamp;
         self.live_buffer.push(frame);
+        self.router_revision = self.router_revision.wrapping_add(1);
         self.timeline.observe(timestamp)
     }
 
@@ -326,6 +561,7 @@ impl VirtualTimelineRouter {
     pub fn push_batch(&mut self, frames: Vec<ParsedFrame>) {
         let latest = frames.iter().map(|f| f.timestamp).max();
         self.live_buffer.push_batch(frames);
+        self.router_revision = self.router_revision.wrapping_add(1);
         if let Some(timestamp) = latest {
             self.timeline.observe(timestamp);
         }
@@ -335,6 +571,7 @@ impl VirtualTimelineRouter {
     /// registered canonical SD partitions.
     pub fn reset_live(&mut self, now: Time) {
         self.live_buffer.clear();
+        self.router_revision = self.router_revision.wrapping_add(1);
         self.timeline.reset(now);
         for part in &self.partitions {
             self.timeline
@@ -348,7 +585,7 @@ impl VirtualTimelineRouter {
         let mut max_ms: Option<i64> = None;
 
         for part in &self.partitions {
-            if part.is_local {
+            if self.is_partition_readable(part) {
                 min_ms = Some(min_ms.map_or(part.start_utc_ms, |m| m.min(part.start_utc_ms)));
                 max_ms = Some(max_ms.map_or(part.end_utc_ms, |m| m.max(part.end_utc_ms)));
             }
@@ -364,11 +601,11 @@ impl VirtualTimelineRouter {
         ))
     }
 
-    /// Return the maximum `end_utc_ms` among local canonical SD partitions that start at or before `up_to_utc_ms`.
+    /// Return the maximum `end_utc_ms` among readable canonical SD partitions that start at or before `up_to_utc_ms`.
     fn max_canonical_end_ms(&self, up_to_utc_ms: i64) -> Option<i64> {
         self.partitions
             .iter()
-            .filter(|p| p.is_local && p.start_utc_ms <= up_to_utc_ms)
+            .filter(|p| self.is_partition_readable(p) && p.start_utc_ms <= up_to_utc_ms)
             .map(|p| p.end_utc_ms)
             .max()
     }
@@ -390,12 +627,20 @@ impl VirtualTimelineRouter {
         let start_ms = *range.start();
         let end_ms = *range.end();
 
-        let overlapping_ids: Vec<String> = self
-            .partitions
-            .iter()
-            .filter(|p| p.is_local && p.start_utc_ms <= end_ms && p.end_utc_ms >= start_ms)
-            .map(|p| p.partition_id.clone())
-            .collect();
+        let mut overlapping_ids: Vec<String> = Vec::new();
+        for part in &self.partitions {
+            if part.start_utc_ms <= end_ms && part.end_utc_ms >= start_ms {
+                if !part.is_local
+                    && matches!(resolution, Resolution::Overview10Hz | Resolution::FullRes)
+                    && let Some(sync) = &self.cloud_sync
+                {
+                    sync.request_partition_download(&part.partition_id);
+                }
+                if self.is_partition_readable(part) {
+                    overlapping_ids.push(part.partition_id.clone());
+                }
+            }
+        }
 
         let mut chunks = Vec::new();
         for part_id in &overlapping_ids {
@@ -443,14 +688,40 @@ impl VirtualTimelineRouter {
             return SignalSeries::empty_for(resolution);
         }
 
-        if let Some(compiled) = self.formula_engine.get(signal_id) {
-            let ast = compiled.ast.clone();
-            return self
-                .evaluate_expression(&ast, range, resolution)
-                .unwrap_or_else(|_| SignalSeries::empty_for(resolution));
+        let rev_before = self.data_revision();
+        let cache_key = QueryCacheKey {
+            signal_id: signal_id.to_owned(),
+            start_ms: *range.start(),
+            end_ms: *range.end(),
+            resolution,
+        };
+        if let Ok(mut guard) = self.query_cache.lock() {
+            if guard.revision != rev_before {
+                guard.entries.clear();
+                guard.revision = rev_before;
+            } else if let Some(cached) = guard.entries.get(&cache_key) {
+                return cached.clone();
+            }
         }
 
-        self.query_raw_signal(signal_id, range, resolution)
+        let series = if let Some(compiled) = self.formula_engine.get(signal_id) {
+            let ast = compiled.ast.clone();
+            self.evaluate_expression(&ast, range, resolution)
+                .unwrap_or_else(|_| SignalSeries::empty_for(resolution))
+        } else {
+            self.query_raw_signal(signal_id, range, resolution)
+        };
+
+        let rev_after = self.data_revision();
+        if let Ok(mut guard) = self.query_cache.lock() {
+            if guard.revision != rev_after || guard.entries.len() >= 128 {
+                guard.entries.clear();
+                guard.revision = rev_after;
+            }
+            guard.entries.insert(cache_key, series.clone());
+        }
+
+        series
     }
 
     /// Synchronously query a raw CAN `signal_id` across `range` at exact `resolution`
@@ -469,12 +740,26 @@ impl VirtualTimelineRouter {
         let start_ms = *range.start();
         let end_ms = *range.end();
 
-        let overlapping_ids: Vec<String> = self
-            .partitions
-            .iter()
-            .filter(|p| p.is_local && p.start_utc_ms <= end_ms && p.end_utc_ms >= start_ms)
-            .map(|p| p.partition_id.clone())
-            .collect();
+        let mut overlapping_ids: Vec<String> = Vec::new();
+        for part in &self.partitions {
+            if part.start_utc_ms <= end_ms && part.end_utc_ms >= start_ms {
+                if !part.is_local
+                    && matches!(resolution, Resolution::Overview10Hz | Resolution::FullRes)
+                    && let Some(sync) = &self.cloud_sync
+                {
+                    sync.request_partition_download(&part.partition_id);
+                }
+                if part.is_local
+                    || (resolution == Resolution::Overview1Hz && self.is_partition_readable(part))
+                    || self
+                        .cloud_sync
+                        .as_ref()
+                        .is_some_and(|s| s.is_partition_localized(&part.partition_id))
+                {
+                    overlapping_ids.push(part.partition_id.clone());
+                }
+            }
+        }
 
         let mut chunks = Vec::new();
         for part_id in &overlapping_ids {
@@ -541,7 +826,10 @@ impl VirtualTimelineRouter {
 
         let mut out = Vec::new();
         for part in &self.partitions {
-            if !part.is_local || part.start_utc_ms > end_ms || part.end_utc_ms < start_ms {
+            if !self.is_partition_readable(part)
+                || part.start_utc_ms > end_ms
+                || part.end_utc_ms < start_ms
+            {
                 continue;
             }
             if let Some(intervals) = self
@@ -567,6 +855,12 @@ impl VirtualTimelineRouter {
             );
         }
 
+        if out.is_empty() {
+            let res = Resolution::for_window_ms((end_ms - start_ms).max(1), 1600.0);
+            let series = self.query_signal(signal_id, range.clone(), res);
+            out = rle_intervals_from_series(&series, &range);
+        }
+
         out
     }
 
@@ -578,6 +872,20 @@ impl VirtualTimelineRouter {
         target_utc_ms: i64,
     ) -> Option<(i64, f64)> {
         if self.formula_engine.contains(signal_id) {
+            let cur_rev = self.data_revision();
+            if let Ok(guard) = self.query_cache.lock()
+                && guard.revision == cur_rev
+            {
+                for (k, series) in &guard.entries {
+                    if k.signal_id == signal_id
+                        && k.start_ms <= target_utc_ms
+                        && target_utc_ms <= k.end_ms
+                        && let Some(found) = series.latest_at_or_before(target_utc_ms)
+                    {
+                        return Some(found);
+                    }
+                }
+            }
             let lookback_ms = (self.formula_engine.max_staleness_ms() * 8).max(2_000);
             let window = target_utc_ms.saturating_sub(lookback_ms)..=target_utc_ms;
             let series = self.query_signal(signal_id, window, Resolution::FullRes);
@@ -600,7 +908,7 @@ impl VirtualTimelineRouter {
 
         // Otherwise search canonical partitions in reverse chronological order.
         for part in self.partitions.iter().rev() {
-            if !part.is_local || part.start_utc_ms > target_utc_ms {
+            if !self.is_partition_readable(part) || part.start_utc_ms > target_utc_ms {
                 continue;
             }
             if let Some(found) = self.tile_cache.latest_resident_at_or_before(
@@ -616,6 +924,192 @@ impl VirtualTimelineRouter {
             .latest_signal_value_at(&canonical_id, target_utc_ms)
     }
 
+    /// Find the latest sample `(utc_ms, value)` for `signal_id` (raw or derived) within `range`
+    /// (`[start_utc_ms..=end_utc_ms]`) without blocking.
+    pub fn latest_signal_value_in_range(
+        &self,
+        signal_id: &str,
+        range: ops::RangeInclusive<i64>,
+    ) -> Option<(i64, f64)> {
+        if range.is_empty() {
+            return None;
+        }
+        let start_ms = *range.start();
+        let end_ms = *range.end();
+
+        if self.formula_engine.contains(signal_id) {
+            let found = self.latest_signal_value_at(signal_id, end_ms)?;
+            return (found.0 >= start_ms).then_some(found);
+        }
+
+        let canonical_id = canonicalize_signal_ref(signal_id);
+        let max_canonical = self.max_canonical_end_ms(end_ms);
+
+        let live_start_ms = match max_canonical {
+            Some(max_end) => start_ms.max(max_end.saturating_add(1)),
+            None => start_ms,
+        };
+        if live_start_ms <= end_ms
+            && let Some(found) = self
+                .live_buffer
+                .latest_signal_value_in_range(&canonical_id, live_start_ms..=end_ms)
+        {
+            return Some(found);
+        }
+
+        for part in self.partitions.iter().rev() {
+            if !self.is_partition_readable(part)
+                || part.start_utc_ms > end_ms
+                || part.end_utc_ms < start_ms
+            {
+                continue;
+            }
+            if let Some(sig_entry) = part
+                .manifest
+                .signals
+                .iter()
+                .find(|s| s.signal_id == canonical_id)
+                && (sig_entry.sample_count == 0
+                    || sig_entry.min_utc_ms > end_ms
+                    || sig_entry.max_utc_ms < start_ms)
+            {
+                continue;
+            }
+            let part_range = start_ms.max(part.start_utc_ms)..=end_ms.min(part.end_utc_ms);
+            if let Some(found) = self.tile_cache.latest_resident_in_range(
+                &part.partition_id,
+                &canonical_id,
+                part_range,
+            ) {
+                return Some(found);
+            }
+        }
+
+        self.live_buffer
+            .latest_signal_value_in_range(&canonical_id, start_ms..=end_ms)
+    }
+
+    /// Return sorted, deduplicated metadata for all raw signals that have at least one sample
+    /// inside `range` (`[start_utc_ms..=end_utc_ms]`).
+    pub fn active_signals_in_range(
+        &self,
+        range: ops::RangeInclusive<i64>,
+    ) -> Vec<ActiveSignalMeta> {
+        if range.is_empty() {
+            return Vec::new();
+        }
+        let start_ms = *range.start();
+        let end_ms = *range.end();
+        let mut by_id: std::collections::BTreeMap<String, ActiveSignalMeta> =
+            std::collections::BTreeMap::new();
+
+        for part in &self.partitions {
+            if !self.is_partition_readable(part)
+                || part.start_utc_ms > end_ms
+                || part.end_utc_ms < start_ms
+            {
+                continue;
+            }
+            let clamped = start_ms.max(part.start_utc_ms)..=end_ms.min(part.end_utc_ms);
+            for sig_entry in &part.manifest.signals {
+                if by_id.contains_key(&sig_entry.signal_id) {
+                    continue;
+                }
+                if self.tile_cache.partition_signal_has_samples_in_range(
+                    &part.partition_id,
+                    sig_entry,
+                    clamped.clone(),
+                ) {
+                    by_id.insert(
+                        sig_entry.signal_id.clone(),
+                        ActiveSignalMeta::from_manifest_entry(sig_entry),
+                    );
+                }
+            }
+        }
+
+        let live_start_ms = match self.max_canonical_end_ms(end_ms) {
+            Some(max_end) => start_ms.max(max_end.saturating_add(1)),
+            None => start_ms,
+        };
+        if live_start_ms <= end_ms {
+            for meta in self
+                .live_buffer
+                .active_signals_in_range(live_start_ms..=end_ms)
+            {
+                by_id.entry(meta.signal_id.clone()).or_insert(meta);
+            }
+        }
+
+        by_id.into_values().collect()
+    }
+
+    /// Return metadata for all raw signals that have samples in the active viewport
+    /// (`timeline.range_ms()`, plus any selected comparison slice spans when comparison mode is active).
+    pub fn active_signals_in_viewport(&self) -> Vec<ActiveSignalMeta> {
+        if !self.timeline.is_comparison_mode() {
+            return self.active_signals_in_range(self.timeline.range_ms());
+        }
+        let mut by_id: std::collections::BTreeMap<String, ActiveSignalMeta> =
+            std::collections::BTreeMap::new();
+        for meta in self.active_signals_in_range(self.timeline.range_ms()) {
+            by_id.insert(meta.signal_id.clone(), meta);
+        }
+        if let Ok(anns) = self.query_annotations_in_range(i64::MIN..=i64::MAX) {
+            for selected_id in self.timeline.selected_annotation_ids() {
+                if let Some(ann) = anns.iter().find(|a| &a.id == selected_id) {
+                    let hi = ann
+                        .end_utc_ms
+                        .unwrap_or(ann.start_utc_ms)
+                        .max(ann.start_utc_ms);
+                    for meta in self.active_signals_in_range(ann.start_utc_ms..=hi) {
+                        by_id.entry(meta.signal_id.clone()).or_insert(meta);
+                    }
+                }
+            }
+        }
+        by_id.into_values().collect()
+    }
+
+    /// Return metadata for all raw signals that have samples in `[timeline.start_utc_ms()..=timeline.setpoint_utc_ms()]`.
+    pub fn active_signals_to_setpoint(&self) -> Vec<ActiveSignalMeta> {
+        self.active_signals_in_range(self.timeline.setpoint_range_ms())
+    }
+
+    /// Look up self-contained metadata (`unit`, `bus_name`, `can_id`, `transmitter`, etc.) for
+    /// `signal_id` from registered partition manifests or the live buffer without requiring a `SuperDBC`.
+    pub fn signal_meta(&self, signal_id: &str) -> Option<ActiveSignalMeta> {
+        let canonical_id = canonicalize_signal_ref(signal_id);
+        let win = self.timeline.range_ms();
+        for part in self.partitions.iter().rev() {
+            if !self.is_partition_readable(part)
+                || part.start_utc_ms > *win.end()
+                || part.end_utc_ms < *win.start()
+            {
+                continue;
+            }
+            if let Some(entry) = part
+                .manifest
+                .signals
+                .iter()
+                .find(|s| s.signal_id == canonical_id)
+            {
+                return Some(ActiveSignalMeta::from_manifest_entry(entry));
+            }
+        }
+        for part in self.partitions.iter().rev() {
+            if let Some(entry) = part
+                .manifest
+                .signals
+                .iter()
+                .find(|s| s.signal_id == canonical_id)
+            {
+                return Some(ActiveSignalMeta::from_manifest_entry(entry));
+            }
+        }
+        self.live_buffer.signal_meta(&canonical_id).cloned()
+    }
+
     /// Return the data coverage spans (`CanonicalSd` and `LiveProvisional`) overlapping `range`.
     pub fn coverage_spans(&self, range: ops::RangeInclusive<i64>) -> Vec<CoverageSpan> {
         if range.is_empty() {
@@ -626,7 +1120,10 @@ impl VirtualTimelineRouter {
         let mut spans = Vec::new();
 
         for part in &self.partitions {
-            if !part.is_local || part.start_utc_ms > end_ms || part.end_utc_ms < start_ms {
+            if !self.is_partition_readable(part)
+                || part.start_utc_ms > end_ms
+                || part.end_utc_ms < start_ms
+            {
                 continue;
             }
             spans.push(CoverageSpan {
@@ -658,7 +1155,31 @@ impl VirtualTimelineRouter {
     }
 
     pub fn list_track_days(&self) -> Result<Vec<TrackDay>, RouterError> {
-        Ok(self.registry.list_track_days()?)
+        if let Ok(guard) = self.cached_track_days.lock()
+            && let Some(cached) = guard.as_ref()
+        {
+            return Ok(cached.clone());
+        }
+        let days = self.registry.list_track_days()?;
+        if let Ok(mut guard) = self.cached_track_days.lock() {
+            *guard = Some(days.clone());
+        }
+        Ok(days)
+    }
+
+    /// Update the human-readable label (`location` and `title`) for `track_day_id`,
+    /// invalidating the cached track day list and pushing the update to `daqcloud` if connected.
+    pub fn set_track_day_label(
+        &mut self,
+        track_day_id: &str,
+        label: &str,
+    ) -> Result<TrackDay, RouterError> {
+        let updated = self.registry.set_track_day_label(track_day_id, label)?;
+        self.invalidate_metadata_cache();
+        if let Some(sync) = &self.cloud_sync {
+            sync.push_track_day(updated.clone());
+        }
+        Ok(updated)
     }
 
     /// Select a specific `TrackDay` (or `None` for all captured days), recomputing `day_bounds_ms`
@@ -669,6 +1190,9 @@ impl VirtualTimelineRouter {
     ) -> Result<Option<(i64, i64)>, RouterError> {
         self.timeline.set_active_track_day_id(track_day_id.clone());
         self.timeline.clear_selected_annotations();
+        if let Some(sync) = &self.cloud_sync {
+            sync.set_active_track_day(track_day_id.clone());
+        }
 
         let mut min_ms: Option<i64> = None;
         let mut max_ms: Option<i64> = None;
@@ -726,7 +1250,10 @@ impl VirtualTimelineRouter {
 
         let mut merged: std::collections::BTreeMap<i64, u32> = std::collections::BTreeMap::new();
         for part in &self.partitions {
-            if !part.is_local || part.start_utc_ms > end_ms || part.end_utc_ms < start_ms {
+            if !self.is_partition_readable(part)
+                || part.start_utc_ms > end_ms
+                || part.end_utc_ms < start_ms
+            {
                 continue;
             }
             if let Some(buckets) = self.tile_cache.partition_activity_1hz(&part.partition_id) {
@@ -770,7 +1297,7 @@ impl VirtualTimelineRouter {
     pub fn clock_provenance_at(&self, target_utc_ms: i64) -> Option<ClockProvenance> {
         // 1. Exact containment inside a canonical SD partition
         for part in &self.partitions {
-            if part.is_local
+            if self.is_partition_readable(part)
                 && part.start_utc_ms <= target_utc_ms
                 && target_utc_ms <= part.end_utc_ms
             {
@@ -796,7 +1323,11 @@ impl VirtualTimelineRouter {
         if let Some(part) = self
             .partitions
             .iter()
-            .filter(|p| p.is_local && p.start_utc_ms <= win_end && p.end_utc_ms >= win_start)
+            .filter(|p| {
+                self.is_partition_readable(p)
+                    && p.start_utc_ms <= win_end
+                    && p.end_utc_ms >= win_start
+            })
             .min_by_key(|p| {
                 if target_utc_ms < p.start_utc_ms {
                     p.start_utc_ms - target_utc_ms
@@ -826,14 +1357,41 @@ impl VirtualTimelineRouter {
         if range.is_empty() {
             return Ok(Vec::new());
         }
-        Ok(self
+        let q_start = *range.start();
+        let q_end = *range.end();
+        if let Ok(guard) = self.cached_annotations.lock()
+            && let Some(anns) = guard.as_ref()
+        {
+            return Ok(anns
+                .iter()
+                .filter(|a| match a.end_utc_ms {
+                    None => a.start_utc_ms >= q_start && a.start_utc_ms <= q_end,
+                    Some(end_ms) => a.start_utc_ms <= q_end && end_ms >= q_start,
+                })
+                .cloned()
+                .collect());
+        }
+        let all = self
             .registry
-            .query_annotations_in_range(*range.start(), *range.end(), false)?)
+            .query_annotations_in_range(i64::MIN, i64::MAX, false)?;
+        let filtered = all
+            .iter()
+            .filter(|a| match a.end_utc_ms {
+                None => a.start_utc_ms >= q_start && a.start_utc_ms <= q_end,
+                Some(end_ms) => a.start_utc_ms <= q_end && end_ms >= q_start,
+            })
+            .cloned()
+            .collect();
+        if let Ok(mut guard) = self.cached_annotations.lock() {
+            *guard = Some(all);
+        }
+        Ok(filtered)
     }
 
     /// Insert or update an annotation in the registry and expand day bounds if needed.
     pub fn upsert_annotation(&mut self, annotation: &Annotation) -> Result<bool, RouterError> {
         let changed = self.registry.upsert_annotation(annotation)?;
+        self.invalidate_metadata_cache();
         let end_ms = annotation
             .end_utc_ms
             .unwrap_or(annotation.start_utc_ms)
@@ -850,6 +1408,9 @@ impl VirtualTimelineRouter {
             self.timeline
                 .set_active_track_day_id(Some(annotation.track_day_id.clone()));
         }
+        if changed && let Some(sync) = &self.cloud_sync {
+            sync.push_annotation(annotation.clone());
+        }
         Ok(changed)
     }
 
@@ -862,15 +1423,75 @@ impl VirtualTimelineRouter {
         let deleted = self
             .registry
             .soft_delete_annotation(annotation_id, updated_at_ms)?;
+        self.invalidate_metadata_cache();
         if self.timeline.is_annotation_selected(annotation_id) {
             self.timeline
                 .toggle_comparison_annotation(annotation_id.to_owned(), 0, None);
+        }
+        if deleted && let Some(sync) = &self.cloud_sync {
+            sync.delete_annotation(annotation_id.to_owned(), updated_at_ms);
         }
         Ok(deleted)
     }
 }
 
-use std::io;
+fn rle_intervals_from_series(
+    series: &SignalSeries,
+    range: &ops::RangeInclusive<i64>,
+) -> Vec<StateInterval> {
+    let pairs: Vec<(i64, i64)> = match series {
+        SignalSeries::Exact {
+            timestamps_ms,
+            values,
+        } => timestamps_ms
+            .iter()
+            .copied()
+            .zip(values.iter().copied())
+            .filter(|&(_, v)| v.is_finite())
+            .map(|(t, v)| (t, v.round() as i64))
+            .collect(),
+        SignalSeries::Envelope(buckets) => buckets
+            .iter()
+            .filter(|b| b.mean.is_finite())
+            .map(|b| (b.utc_ms, b.mean.round() as i64))
+            .collect(),
+    };
+    let Some(&(first_t, first_raw)) = pairs.first() else {
+        return Vec::new();
+    };
+    let mut intervals = Vec::new();
+    let mut cur_start = first_t;
+    let mut last_t = first_t;
+    let mut cur_raw = first_raw;
+    for &(t, raw) in &pairs[1..] {
+        if raw == cur_raw {
+            last_t = t;
+        } else {
+            let interval = StateInterval {
+                start_utc_ms: cur_start,
+                end_utc_ms: t,
+                raw_int: cur_raw,
+                label: format!("RAW_{cur_raw}"),
+            };
+            if let Some(clamped) = interval.clamped_to(range) {
+                intervals.push(clamped);
+            }
+            cur_start = t;
+            last_t = t;
+            cur_raw = raw;
+        }
+    }
+    let tail = StateInterval {
+        start_utc_ms: cur_start,
+        end_utc_ms: last_t.max(cur_start),
+        raw_int: cur_raw,
+        label: format!("RAW_{cur_raw}"),
+    };
+    if let Some(clamped) = tail.clamped_to(range) {
+        intervals.push(clamped);
+    }
+    intervals
+}
 
 #[cfg(test)]
 mod tests {
@@ -1447,9 +2068,9 @@ mod tests {
         let mut router = VirtualTimelineRouter::open_store(&store_dir, Time::now(), 30.0)
             .expect("open PER26 store with default FormulaEngine");
 
-        // 1. Verify all 21 default derived signals from daq/config/derived_signals.json are loaded
+        // 1. Verify all 25 default derived signals from daq/config/derived_signals.json are loaded
         let descriptors = router.formula_engine().definitions();
-        assert_eq!(descriptors.len(), 21);
+        assert_eq!(descriptors.len(), 25);
         for id in [
             "battery.voltage_v",
             "battery.power_w",
@@ -1458,6 +2079,10 @@ mod tests {
             "vd.front_heave_mm",
             "vd.front_roll_displacement_mm",
             "vd.fl_damper_vel_mms",
+            "vd.fl_shockpot_50hz_mm",
+            "vd.fr_shockpot_50hz_mm",
+            "vd.rl_shockpot_50hz_mm",
+            "vd.rr_shockpot_50hz_mm",
             "vd.total_accel_g",
             "vd.understeer_gradient",
             "thermals.max_igbt_temp_c",
@@ -1839,6 +2464,42 @@ mod tests {
 
         let bounds = router.select_track_day(Some(day_id)).unwrap();
         assert_eq!(bounds, Some((p1_start_ms, p1_start_ms + 9_000)));
+
+        // Verify range-based signal discovery and metadata without SuperDBC
+        let active_in_part = router.active_signals_in_range(p1_start_ms..=(p1_start_ms + 5_000));
+        assert_eq!(active_in_part.len(), 1);
+        assert_eq!(active_in_part[0].signal_id, "wheel_speeds.speed_mps");
+        assert_eq!(active_in_part[0].unit, "m/s");
+        assert_eq!(active_in_part[0].bus_name, "VCAN");
+        assert_eq!(active_in_part[0].can_id, 100);
+        assert_eq!(active_in_part[0].transmitter, "MAIN_MODULE");
+        assert_eq!(active_in_part[0].nominal_period_ms, Some(100));
+
+        // Sub-range inside the idle gap between the partition (ends at +9_000) and live frame (+20_000)
+        // must report zero active signals!
+        let active_in_gap =
+            router.active_signals_in_range((p1_start_ms + 11_000)..=(p1_start_ms + 18_000));
+        assert!(active_in_gap.is_empty());
+        assert_eq!(
+            router.latest_signal_value_in_range(
+                "wheel_speeds.speed_mps",
+                (p1_start_ms + 11_000)..=(p1_start_ms + 18_000),
+            ),
+            None
+        );
+
+        // Sub-range covering the live frame at +20_000 reports the live signal and metadata
+        let active_in_live =
+            router.active_signals_in_range((p1_start_ms + 19_000)..=(p1_start_ms + 21_000));
+        assert_eq!(active_in_live.len(), 1);
+        assert_eq!(active_in_live[0].signal_id, "wheel_speeds.speed_mps");
+        assert_eq!(
+            router.latest_signal_value_in_range(
+                "wheel_speeds.speed_mps",
+                (p1_start_ms + 19_000)..=(p1_start_ms + 21_000),
+            ),
+            Some((p1_start_ms + 20_000, 15.0))
+        );
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }

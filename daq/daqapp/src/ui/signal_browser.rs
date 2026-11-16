@@ -1,4 +1,4 @@
-use crate::{action, app, widget_constructor};
+use crate::{action, ui, widget_constructor};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Drag-and-drop payload emitted when a user drags a signal or derived formula from
@@ -30,7 +30,6 @@ impl DraggedSignal {
         }
     }
 
-    #[cfg(test)]
     pub fn display_label(&self) -> String {
         match self {
             Self::Raw {
@@ -161,6 +160,9 @@ pub struct SignalBrowserState {
     pub bus_filter: Option<String>,
     pub node_filter: Option<String>,
     pub formula_draft: Option<FormulaDraft>,
+    pub show_filters: bool,
+    pub tree_mode: bool,
+    pub hover_utc_ms: Option<i64>,
 }
 
 /// Test whether a candidate text set matches a user search query (supporting glob wildcards
@@ -207,26 +209,243 @@ struct MessageGroup {
     signals: Vec<SignalLeaf>,
 }
 
+fn format_sidebar_value(v: f64) -> String {
+    if !v.is_finite() {
+        return String::new();
+    }
+    let rounded = v.round();
+    if (v - rounded).abs() < 1e-6 && v.abs() < 1e9 {
+        let int_val = if rounded == 0.0 { 0.0 } else { rounded };
+        format!("{int_val:.0}")
+    } else if v.abs() >= 1000.0 {
+        format!("{v:.1}")
+    } else if v.abs() >= 1.0 {
+        format!("{v:.2}")
+    } else {
+        format!("{v:.3}")
+    }
+}
+
+/// Render a single clean Nominal / AdvantageScope-style channel row:
+/// `[icon]  channel_name                           [latest_val] [unit]`
+/// No permanent `[Plot]` / `[Edit]` buttons cluttering the row.
+#[allow(clippy::too_many_arguments)]
+fn show_clean_channel_row(
+    ui: &mut eframe::egui::Ui,
+    dnd_id: eframe::egui::Id,
+    icon: &str,
+    icon_color: eframe::egui::Color32,
+    canonical_id: &str,
+    primary_text: &str,
+    unit_text: &str,
+    hover_tooltip: &str,
+    drag_payload: DraggedSignal,
+    edit_formula: Option<&daqcore::analysis::CompiledDerivedSignal>,
+    cursor_utc_ms: i64,
+    router: &daqcore::router::VirtualTimelineRouter,
+    state: &mut SignalBrowserState,
+    action_queue: &mut Vec<action::AppAction>,
+    muted_color: eframe::egui::Color32,
+) {
+    let row_w = ui.available_width().max(80.0);
+    let row_h = 20.0_f32;
+
+    let dnd_resp = ui.dnd_drag_source(dnd_id, drag_payload.clone(), |ui| {
+        let (rect, _) = ui.allocate_exact_size(
+            eframe::egui::vec2(row_w, row_h),
+            eframe::egui::Sense::hover(),
+        );
+        if !ui.is_rect_visible(rect) {
+            return;
+        }
+        let is_hovered = ui.rect_contains_pointer(rect);
+        let painter = ui.painter_at(rect.intersect(ui.clip_rect()));
+
+        if is_hovered {
+            painter.rect_filled(
+                rect,
+                3.0,
+                ui.visuals()
+                    .widgets
+                    .hovered
+                    .bg_fill
+                    .gamma_multiply(0.65_f32),
+            );
+        }
+
+        let latest_val_str = router
+            .latest_signal_value_at(canonical_id, cursor_utc_ms)
+            .map(|(_, v)| format_sidebar_value(v))
+            .filter(|s| !s.is_empty());
+
+        // Right-aligned live/cursor value + unit (AdvantageScope / Nominal style)
+        let mut right_cursor = rect.right() - 4.0;
+        if !unit_text.is_empty() {
+            let unit_galley = painter.layout_no_wrap(
+                unit_text.to_owned(),
+                eframe::egui::FontId::monospace(10.5),
+                muted_color,
+            );
+            let uw = unit_galley.size().x;
+            painter.galley(
+                eframe::egui::pos2(
+                    right_cursor - uw,
+                    rect.center().y - unit_galley.size().y * 0.5,
+                ),
+                unit_galley,
+                muted_color,
+            );
+            right_cursor -= uw + 4.0;
+        }
+
+        if let Some(val_str) = &latest_val_str {
+            let val_color = ui.visuals().strong_text_color();
+            let val_galley = painter.layout_no_wrap(
+                val_str.clone(),
+                eframe::egui::FontId::monospace(11.0),
+                val_color,
+            );
+            let vw = val_galley.size().x;
+            painter.galley(
+                eframe::egui::pos2(
+                    right_cursor - vw,
+                    rect.center().y - val_galley.size().y * 0.5,
+                ),
+                val_galley,
+                val_color,
+            );
+            right_cursor -= vw + 6.0;
+        } else {
+            right_cursor -= 4.0;
+        }
+
+        // Left icon (`ƒ` or `•`)
+        painter.text(
+            eframe::egui::pos2(rect.left() + 5.0, rect.center().y),
+            eframe::egui::Align2::LEFT_CENTER,
+            icon,
+            eframe::egui::FontId::monospace(11.0),
+            icon_color,
+        );
+
+        // Primary channel name clipped cleanly before the value/unit column
+        let text_left = rect.left() + 18.0;
+        let text_right = right_cursor.max(text_left + 16.0);
+        let text_clip = eframe::egui::Rect::from_min_max(
+            eframe::egui::pos2(text_left, rect.top()),
+            eframe::egui::pos2(text_right, rect.bottom()),
+        )
+        .intersect(ui.clip_rect());
+
+        if text_clip.width() > 4.0 {
+            ui.painter_at(text_clip).text(
+                eframe::egui::pos2(text_left, rect.center().y),
+                eframe::egui::Align2::LEFT_CENTER,
+                primary_text,
+                eframe::egui::FontId::monospace(11.5),
+                ui.visuals().text_color(),
+            );
+        }
+    });
+
+    let row_resp = ui
+        .interact(
+            dnd_resp.response.rect,
+            dnd_id,
+            eframe::egui::Sense::click_and_drag(),
+        )
+        .on_hover_text(hover_tooltip);
+    if row_resp.double_clicked() {
+        action_queue.push(action::AppAction::SpawnWidget(
+            drag_payload.to_widget_constructor(),
+        ));
+    }
+    row_resp.context_menu(|ui| {
+        if ui.button("Plot in new Scope").clicked() {
+            action_queue.push(action::AppAction::SpawnWidget(
+                drag_payload.to_widget_constructor(),
+            ));
+            ui.close();
+        }
+        if ui.button("Open in new State Lane").clicked() {
+            action_queue.push(action::AppAction::SpawnWidget(
+                widget_constructor::WidgetConstructor::StateLaneSingle {
+                    signal_id: drag_payload.signal_id(),
+                    label: drag_payload.display_label(),
+                },
+            ));
+            ui.close();
+        }
+        if let Some(compiled) = edit_formula
+            && ui.button("Edit Formula…").clicked()
+        {
+            state.formula_draft = Some(FormulaDraft::from_compiled(compiled));
+            ui.close();
+        }
+    });
+}
+
 pub fn show_signal_browser(
     ui: &mut eframe::egui::Ui,
     state: &mut SignalBrowserState,
-    database: Option<&app::DatabaseSelection>,
     router: &mut daqcore::router::VirtualTimelineRouter,
     action_queue: &mut Vec<action::AppAction>,
     diagnostic: &mut Option<String>,
 ) {
+    let theme = ui::theme::get_theme(ui.ctx());
+    let accent_color = theme.accent_color();
+    let muted_color = theme.muted_text_color();
+
     ui.set_max_width(ui.available_width());
 
-    ui.horizontal_wrapped(|ui| {
-        ui.strong("Signal & Formula Browser");
-        if ui
-            .small_button("+ New Formula")
-            .on_hover_text("Define a new vectorized derived formula channel")
-            .clicked()
-        {
-            state.formula_draft = Some(FormulaDraft::default());
-        }
-    });
+    // Nominal-style compact header: `CHANNELS` on left, view/filter/new buttons on right
+    let header_w = ui.available_width();
+    ui.allocate_ui_with_layout(
+        eframe::egui::vec2(header_w, 22.0),
+        eframe::egui::Layout::left_to_right(eframe::egui::Align::Center),
+        |ui| {
+            ui.set_max_width(header_w);
+            ui.label(
+                eframe::egui::RichText::new("CHANNELS")
+                    .small()
+                    .strong()
+                    .color(muted_color),
+            );
+            ui.with_layout(
+                eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
+                |ui| {
+                    if ui
+                        .small_button("+")
+                        .on_hover_text("New derived formula channel")
+                        .clicked()
+                    {
+                        state.formula_draft = Some(FormulaDraft::default());
+                    }
+                    let has_active_filter =
+                        state.bus_filter.is_some() || state.node_filter.is_some();
+                    if ui
+                        .selectable_label(state.show_filters || has_active_filter, "Filter")
+                        .on_hover_text("Filter channels by CAN Bus or Transmitter Node")
+                        .clicked()
+                    {
+                        state.show_filters = !state.show_filters;
+                    }
+                    if ui
+                        .selectable_label(
+                            state.tree_mode,
+                            if state.tree_mode { "Tree" } else { "Flat" },
+                        )
+                        .on_hover_text(
+                            "Toggle between Flat channel list (Nominal style) and Message Tree",
+                        )
+                        .clicked()
+                    {
+                        state.tree_mode = !state.tree_mode;
+                    }
+                },
+            );
+        },
+    );
 
     // Search bar (right-to-left so the clear button deducts from available_width first
     // and never causes a frame-over-frame SidePanel width feedback loop; explicit id_salt
@@ -248,108 +467,77 @@ pub fn show_signal_browser(
                 state.search_query.clear();
             }
             let edit_width = (ui.available_width() - 14.0).max(40.0);
-            ui.add(
+            let resp = ui.add(
                 eframe::egui::TextEdit::singleline(&mut state.search_query)
                     .id(eframe::egui::Id::new("signal_browser_search_input"))
                     .desired_width(edit_width)
-                    .hint_text("Search signal, message, unit, or glob…"),
+                    .hint_text("🔍 Search channel, unit, or glob… (/)"),
             );
+            if resp.has_focus() && ui.input(|i| i.key_pressed(eframe::egui::Key::Escape)) {
+                resp.surrender_focus();
+            }
         },
     );
 
-    // Build message groups from SuperDBC + fallback signals from partition manifests / live buffer
+    // Build message groups strictly from signals active in the current timeline viewport
     let mut bus_names: BTreeSet<String> = BTreeSet::new();
     let mut node_names: BTreeSet<String> = BTreeSet::new();
     let mut groups_by_msg: BTreeMap<String, MessageGroup> = BTreeMap::new();
 
-    if let Some(db_sel) = database {
-        for bus in db_sel.database.buses() {
-            bus_names.insert(bus.name().to_owned());
-            for msg in bus.messages() {
-                node_names.insert(msg.transmitter().to_owned());
-                let signals = msg
-                    .signals()
-                    .iter()
-                    .map(|sig| SignalLeaf {
-                        key: Some(msg.key()),
-                        msg_name: msg.name().to_owned(),
-                        signal_name: sig.name().to_owned(),
-                        unit: sig.unit().to_owned(),
-                        description: sig.description().to_owned(),
-                    })
-                    .collect();
-                groups_by_msg.insert(
-                    msg.name().to_owned(),
-                    MessageGroup {
-                        key: Some(msg.key()),
-                        bus_name: bus.name().to_owned(),
-                        transmitter: msg.transmitter().to_owned(),
-                        msg_name: msg.name().to_owned(),
-                        description: msg.description().to_owned(),
-                        signals,
-                    },
-                );
-            }
+    for meta in router.active_signals_in_viewport() {
+        let (msg_name, sig_name) = meta.split_message_signal();
+        if msg_name.is_empty() {
+            continue;
+        }
+        let bus_name = if meta.bus_name.is_empty() {
+            "CAN".to_owned()
+        } else {
+            meta.bus_name.clone()
+        };
+        let transmitter = if meta.transmitter.is_empty() {
+            "Unknown".to_owned()
+        } else {
+            meta.transmitter.clone()
+        };
+        bus_names.insert(bus_name.clone());
+        node_names.insert(transmitter.clone());
+
+        let key = (meta.can_id != 0 || !meta.bus_name.is_empty()).then_some(
+            daqcore::superdbc::message::MessageKey {
+                bus_id: meta.bus_id,
+                identity: meta.can_id,
+            },
+        );
+
+        let group = groups_by_msg
+            .entry(msg_name.to_owned())
+            .or_insert_with(|| MessageGroup {
+                key,
+                bus_name,
+                transmitter,
+                msg_name: msg_name.to_owned(),
+                description: String::new(),
+                signals: Vec::new(),
+            });
+        if !group.signals.iter().any(|s| s.signal_name == sig_name) {
+            group.signals.push(SignalLeaf {
+                key: group.key,
+                msg_name: msg_name.to_owned(),
+                signal_name: sig_name.to_owned(),
+                unit: meta.unit,
+                description: meta.description,
+            });
         }
     }
 
-    // Merge any signals from loaded Parquet partition manifests or live buffer not in SuperDBC
-    for part in router.partitions() {
-        for sig_entry in &part.manifest.signals {
-            if let Some((msg_name, sig_name)) = sig_entry.signal_id.split_once('.') {
-                let group =
-                    groups_by_msg
-                        .entry(msg_name.to_owned())
-                        .or_insert_with(|| MessageGroup {
-                            key: None,
-                            bus_name: "Store".to_owned(),
-                            transmitter: "Parquet".to_owned(),
-                            msg_name: msg_name.to_owned(),
-                            description: String::new(),
-                            signals: Vec::new(),
-                        });
-                if !group.signals.iter().any(|s| s.signal_name == sig_name) {
-                    group.signals.push(SignalLeaf {
-                        key: group.key,
-                        msg_name: msg_name.to_owned(),
-                        signal_name: sig_name.to_owned(),
-                        unit: sig_entry.unit.clone(),
-                        description: String::new(),
-                    });
-                }
-            }
-        }
-    }
-    for sig_id in router.live_buffer().signal_ids() {
-        if let Some((msg_name, sig_name)) = sig_id.split_once('.') {
-            let group = groups_by_msg
-                .entry(msg_name.to_owned())
-                .or_insert_with(|| MessageGroup {
-                    key: None,
-                    bus_name: "Live".to_owned(),
-                    transmitter: "Live".to_owned(),
-                    msg_name: msg_name.to_owned(),
-                    description: String::new(),
-                    signals: Vec::new(),
-                });
-            if !group.signals.iter().any(|s| s.signal_name == sig_name) {
-                group.signals.push(SignalLeaf {
-                    key: group.key,
-                    msg_name: msg_name.to_owned(),
-                    signal_name: sig_name.to_owned(),
-                    unit: String::new(),
-                    description: String::new(),
-                });
-            }
-        }
-    }
-
-    // Optional Bus & Node Filter tags
-    if !bus_names.is_empty() || !node_names.is_empty() {
+    // Optional Bus & Node Filter tags (shown only when toggled or active)
+    if (state.show_filters || state.bus_filter.is_some() || state.node_filter.is_some())
+        && (!bus_names.is_empty() || !node_names.is_empty())
+    {
         ui.horizontal_wrapped(|ui| {
             let bus_label = state.bus_filter.as_deref().unwrap_or("All Buses");
             eframe::egui::ComboBox::from_id_salt("signal_browser_bus_filter")
-                .width(96.0)
+                .width(92.0)
                 .selected_text(format!("Bus: {bus_label}"))
                 .show_ui(ui, |ui| {
                     if ui
@@ -370,7 +558,7 @@ pub fn show_signal_browser(
 
             let node_label = state.node_filter.as_deref().unwrap_or("All Nodes");
             eframe::egui::ComboBox::from_id_salt("signal_browser_node_filter")
-                .width(110.0)
+                .width(104.0)
                 .selected_text(format!("Node: {node_label}"))
                 .show_ui(ui, |ui| {
                     if ui
@@ -391,24 +579,14 @@ pub fn show_signal_browser(
         });
     }
 
-    ui.add(
-        eframe::egui::Label::new(
-            eframe::egui::RichText::new(
-                "Drag any signal/formula onto a Scope or GPS Plot, or click Plot",
-            )
-            .small()
-            .weak(),
-        )
-        .wrap(),
-    );
+    ui.add_space(2.0);
 
     ui.scope(|ui| {
         ui.set_max_width(ui.available_width());
         ui.style_mut().wrap_mode = Some(eframe::egui::TextWrapMode::Truncate);
+        ui.spacing_mut().item_spacing.y = 1.0;
 
-        // -------------------------------------------------------------------------
-        // 1. Top-level "Derived Signals (Formulas)" Folder
-        // -------------------------------------------------------------------------
+        // 1. Derived Signals (Formulas)
         let compiled_formulas: Vec<daqcore::analysis::CompiledDerivedSignal> =
             router.formula_engine().definitions().to_vec();
         let matching_formulas: Vec<&daqcore::analysis::CompiledDerivedSignal> = compiled_formulas
@@ -427,88 +605,7 @@ pub fn show_signal_browser(
             })
             .collect();
 
-        eframe::egui::CollapsingHeader::new(
-            eframe::egui::RichText::new(format!(
-                "Derived Signals (Formulas) ({})",
-                matching_formulas.len()
-            ))
-            .strong(),
-        )
-        .id_salt("signal_browser_derived_folder")
-        .default_open(true)
-        .show(ui, |ui| {
-            if matching_formulas.is_empty() {
-                ui.label(eframe::egui::RichText::new("No matching formulas.").weak().small());
-            }
-            for compiled in matching_formulas {
-                let def = &compiled.def;
-                let unit_suffix = if def.unit.is_empty() {
-                    String::new()
-                } else {
-                    format!(" [{}]", def.unit)
-                };
-                let drag_payload = DraggedSignal::Derived {
-                    signal_id: def.id.clone(),
-                    label: def.label.clone(),
-                    unit: def.unit.clone(),
-                };
-
-                ui.horizontal(|ui| {
-                    if ui
-                        .small_button("Plot")
-                        .on_hover_text("Open formula in a new Scope")
-                        .clicked()
-                    {
-                        action_queue.push(action::AppAction::SpawnWidget(
-                            drag_payload.to_widget_constructor(),
-                        ));
-                    }
-                    if ui
-                        .small_button("Edit")
-                        .on_hover_text("Edit formula expression")
-                        .clicked()
-                    {
-                        state.formula_draft = Some(FormulaDraft::from_compiled(compiled));
-                    }
-                    let dnd_resp = ui.dnd_drag_source(
-                        eframe::egui::Id::new(("dnd_derived_signal", &def.id)),
-                        drag_payload.clone(),
-                        |ui| {
-                            ui.add(
-                                eframe::egui::Label::new(
-                                    eframe::egui::RichText::new(format!(
-                                        "ƒ {} — {}{}",
-                                        def.id, def.label, unit_suffix
-                                    ))
-                                    .small(),
-                                )
-                                .truncate(),
-                            );
-                        },
-                    );
-                    let row_resp = dnd_resp.response.on_hover_text(format!(
-                        "Formula: {}\nExpression: {}\nDependencies: {}\nDrag onto a Scope/GpsPlot or click Plot",
-                        def.id,
-                        def.expression,
-                        if compiled.dependencies.is_empty() {
-                            "(none)".to_owned()
-                        } else {
-                            compiled.dependencies.join(", ")
-                        }
-                    ));
-                    if row_resp.double_clicked() {
-                        action_queue.push(action::AppAction::SpawnWidget(
-                            drag_payload.to_widget_constructor(),
-                        ));
-                    }
-                });
-            }
-        });
-
-        // -------------------------------------------------------------------------
-        // 2. Hierarchical Tree: Message -> Signal (with Unit)
-        // -------------------------------------------------------------------------
-        let query_active = !state.search_query.trim().is_empty();
+        // 2. Filtered CAN Messages & Signals
         let mut visible_msg_count = 0usize;
         let mut visible_sig_count = 0usize;
 
@@ -556,38 +653,162 @@ pub fn show_signal_browser(
             })
             .collect();
 
-        eframe::egui::CollapsingHeader::new(
-            eframe::egui::RichText::new(format!(
-                "CAN Messages & Signals ({visible_msg_count} msgs, {visible_sig_count} sigs)"
-            ))
-            .strong(),
-        )
-        .id_salt("signal_browser_can_tree")
-        .default_open(true)
-        .show(ui, |ui| {
-            if filtered_groups.is_empty() {
-                ui.label(
-                    eframe::egui::RichText::new("No matching CAN messages or signals.")
-                        .weak()
-                        .small(),
+        let cursor_utc_ms = state
+            .hover_utc_ms
+            .unwrap_or_else(|| router.timeline().setpoint_utc_ms());
+
+        if !state.tree_mode {
+            // -----------------------------------------------------------------
+            // Clean Nominal-style Flat Channel List
+            // -----------------------------------------------------------------
+            for compiled in &matching_formulas {
+                let def = &compiled.def;
+                let drag_payload = DraggedSignal::Derived {
+                    signal_id: def.id.clone(),
+                    label: def.label.clone(),
+                    unit: def.unit.clone(),
+                };
+                let tooltip = format!(
+                    "Formula: {} ({})\nExpression: {}\nDependencies: {}\n\nDrag onto a plot, double-click to open in Scope, or right-click to edit",
+                    def.id,
+                    def.label,
+                    def.expression,
+                    if compiled.dependencies.is_empty() {
+                        "(none)".to_owned()
+                    } else {
+                        compiled.dependencies.join(", ")
+                    }
+                );
+                show_clean_channel_row(
+                    ui,
+                    eframe::egui::Id::new(("dnd_derived_flat", &def.id)),
+                    "ƒ",
+                    accent_color,
+                    &def.id,
+                    &def.id,
+                    &def.unit,
+                    &tooltip,
+                    drag_payload,
+                    Some(compiled),
+                    cursor_utc_ms,
+                    router,
+                    state,
+                    action_queue,
+                    muted_color,
                 );
             }
-            for (group, sigs) in filtered_groups {
-                let header_label = if let Some(k) = group.key {
-                    format!(
-                        "{} [{} · {} · 0x{:03X}] ({})",
-                        group.msg_name,
+
+            for (group, sigs) in &filtered_groups {
+                for sig in sigs {
+                    let canonical_id =
+                        daqcore::storage::format_signal_id(&sig.msg_name, &sig.signal_name);
+                    let drag_payload = DraggedSignal::Raw {
+                        key: sig.key,
+                        msg_name: sig.msg_name.clone(),
+                        signal_name: sig.signal_name.clone(),
+                        unit: sig.unit.clone(),
+                    };
+                    let tooltip = format!(
+                        "Channel: {}\nBus / Node: {} · {}\nUnit: {}\n{}\n\nDrag onto a plot, double-click to open in Scope, or right-click for options",
+                        canonical_id,
                         group.bus_name,
                         group.transmitter,
-                        k.identity,
-                        sigs.len()
-                    )
-                } else {
-                    format!("{} [{}] ({})", group.msg_name, group.bus_name, sigs.len())
-                };
+                        if sig.unit.is_empty() {
+                            "(unitless)"
+                        } else {
+                            sig.unit.as_str()
+                        },
+                        if sig.description.is_empty() {
+                            "(no description)"
+                        } else {
+                            sig.description.as_str()
+                        }
+                    );
+                    show_clean_channel_row(
+                        ui,
+                        eframe::egui::Id::new(("dnd_raw_flat", &canonical_id)),
+                        "•",
+                        muted_color,
+                        &canonical_id,
+                        &canonical_id,
+                        &sig.unit,
+                        &tooltip,
+                        drag_payload,
+                        None,
+                        cursor_utc_ms,
+                        router,
+                        state,
+                        action_queue,
+                        muted_color,
+                    );
+                }
+            }
 
+            if matching_formulas.is_empty() && filtered_groups.is_empty() {
+                ui.label(
+                    eframe::egui::RichText::new(
+                        "No matching CAN messages or signals in the active timeline range.",
+                    )
+                    .weak()
+                    .font(eframe::egui::FontId::monospace(11.5)),
+                );
+            }
+        } else {
+            // -----------------------------------------------------------------
+            // Grouped Tree Mode (matching 11.5pt monospace typography of Flat view)
+            // -----------------------------------------------------------------
+            if !matching_formulas.is_empty() {
+                eframe::egui::CollapsingHeader::new(
+                    eframe::egui::RichText::new(format!(
+                        "ƒ Derived Formulas ({})",
+                        matching_formulas.len()
+                    ))
+                    .font(eframe::egui::FontId::monospace(11.5))
+                    .color(accent_color),
+                )
+                .id_salt("signal_browser_derived_folder")
+                .default_open(true)
+                .show(ui, |ui| {
+                    for compiled in &matching_formulas {
+                        let def = &compiled.def;
+                        let drag_payload = DraggedSignal::Derived {
+                            signal_id: def.id.clone(),
+                            label: def.label.clone(),
+                            unit: def.unit.clone(),
+                        };
+                        let tooltip = format!(
+                            "Formula: {} ({})\nExpression: {}\nRight-click to edit",
+                            def.id, def.label, def.expression
+                        );
+                        show_clean_channel_row(
+                            ui,
+                            eframe::egui::Id::new(("dnd_derived_signal", &def.id)),
+                            "ƒ",
+                            accent_color,
+                            &def.id,
+                            &def.id,
+                            &def.unit,
+                            &tooltip,
+                            drag_payload,
+                            Some(compiled),
+                            cursor_utc_ms,
+                            router,
+                            state,
+                            action_queue,
+                            muted_color,
+                        );
+                    }
+                });
+            }
+
+            let query_active = !state.search_query.trim().is_empty();
+            let _ = visible_sig_count;
+            for (group, sigs) in filtered_groups {
+                let header_label = format!("{} ({})", group.msg_name, sigs.len());
                 let mut header = eframe::egui::CollapsingHeader::new(
-                    eframe::egui::RichText::new(header_label).small().strong(),
+                    eframe::egui::RichText::new(header_label)
+                        .font(eframe::egui::FontId::monospace(11.5))
+                        .color(ui.visuals().text_color()),
                 )
                 .id_salt(("sig_browser_msg", &group.msg_name));
                 if query_active && visible_msg_count <= 25 {
@@ -596,70 +817,41 @@ pub fn show_signal_browser(
 
                 header.show(ui, |ui| {
                     for sig in sigs {
-                        let canonical_id =
-                            daqcore::storage::format_signal_id(&sig.msg_name, &sig.signal_name);
-                        let unit_badge = if sig.unit.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" ({})", sig.unit)
-                        };
+                        let canonical_id = daqcore::storage::format_signal_id(
+                            &sig.msg_name,
+                            &sig.signal_name,
+                        );
                         let drag_payload = DraggedSignal::Raw {
                             key: sig.key,
                             msg_name: sig.msg_name.clone(),
                             signal_name: sig.signal_name.clone(),
                             unit: sig.unit.clone(),
                         };
-
-                        ui.horizontal(|ui| {
-                            if ui
-                                .small_button("Plot")
-                                .on_hover_text(format!("Open {canonical_id} in a new Scope"))
-                                .clicked()
-                            {
-                                action_queue.push(action::AppAction::SpawnWidget(
-                                    drag_payload.to_widget_constructor(),
-                                ));
-                            }
-                            let dnd_resp = ui.dnd_drag_source(
-                                eframe::egui::Id::new(("dnd_raw_signal", &canonical_id)),
-                                drag_payload.clone(),
-                                |ui| {
-                                    ui.add(
-                                        eframe::egui::Label::new(
-                                            eframe::egui::RichText::new(format!(
-                                                "• {}{}",
-                                                sig.signal_name, unit_badge
-                                            ))
-                                            .small(),
-                                        )
-                                        .truncate(),
-                                    );
-                                },
-                            );
-                            let row_resp = dnd_resp.response.on_hover_text(format!(
-                                "Signal ID: {}\nUnit: {}\n{}\nDrag onto a Scope/GpsPlot or click Plot",
-                                canonical_id,
-                                if sig.unit.is_empty() {
-                                    "(unitless)"
-                                } else {
-                                    sig.unit.as_str()
-                                },
-                                if sig.description.is_empty() {
-                                    "(no description)"
-                                } else {
-                                    sig.description.as_str()
-                                }
-                            ));
-                            if row_resp.double_clicked() {
-                                action_queue.push(action::AppAction::SpawnWidget(
-                                    drag_payload.to_widget_constructor(),
-                                ));
-                            }
-                        });
+                        let tooltip = format!(
+                            "Channel: {}\nBus: {} · Node: {}\n{}",
+                            canonical_id, group.bus_name, group.transmitter, sig.description
+                        );
+                        show_clean_channel_row(
+                            ui,
+                            eframe::egui::Id::new(("dnd_raw_signal", &canonical_id)),
+                            "•",
+                            muted_color,
+                            &canonical_id,
+                            &sig.signal_name,
+                            &sig.unit,
+                            &tooltip,
+                            drag_payload,
+                            None,
+                            cursor_utc_ms,
+                            router,
+                            state,
+                            action_queue,
+                            muted_color,
+                        );
                     }
                 });
             }
-        });
+        }
     });
 
     // Render the "+ New Formula" modal if open
@@ -849,143 +1041,8 @@ mod tests {
         assert!(self_cycle.validate(&engine).is_err());
     }
 
-    fn sample_database_selection() -> app::DatabaseSelection {
-        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let dbc_path = manifest_dir.join("../../superdbc/superdbc_per26.json");
-        let database =
-            daqcore::superdbc::database::Database::load(&dbc_path).unwrap_or_else(|_| {
-                let fallback_json = r#"{
-              "content_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-              "versions": { "schema_version": "1.1", "hash": "test_v1" },
-              "buses": {
-                "VCAN": {
-                  "bus_id": 0,
-                  "baud_rate": 500000,
-                  "nodes": [
-                    { "name": "A_BOX", "is_external": false },
-                    { "name": "MAIN_MODULE", "is_external": false }
-                  ],
-                  "messages": [
-                    {
-                      "id": 100,
-                      "is_extended_id": false,
-                      "message_name": "pack_stats",
-                      "transmitter": "A_BOX",
-                      "receivers": [],
-                      "length_bytes": 6,
-                      "nominal_period_ms": 10,
-                      "priority": 1,
-                      "description": "Accumulator pack voltage, current, and temperature telemetry",
-                      "signals": [
-                        {
-                          "signal_name": "vbatt_adc",
-                          "description": "Pack battery voltage",
-                          "data_type": "uint16_t",
-                          "raw_type": "unsigned",
-                          "start_bit": 0,
-                          "bit_length": 16,
-                          "byte_order": "little_endian",
-                          "scale": 0.1,
-                          "offset": 0.0,
-                          "limits": null,
-                          "unit": "V",
-                          "choices": null,
-                          "display_format": null
-                        },
-                        {
-                          "signal_name": "ibatt_adc",
-                          "description": "Pack battery current",
-                          "data_type": "int16_t",
-                          "raw_type": "signed",
-                          "start_bit": 16,
-                          "bit_length": 16,
-                          "byte_order": "little_endian",
-                          "scale": 0.1,
-                          "offset": 0.0,
-                          "limits": null,
-                          "unit": "A",
-                          "choices": null,
-                          "display_format": null
-                        },
-                        {
-                          "signal_name": "max_cell_temp",
-                          "description": "Maximum accumulator cell temperature sensor reading",
-                          "data_type": "int16_t",
-                          "raw_type": "signed",
-                          "start_bit": 32,
-                          "bit_length": 16,
-                          "byte_order": "little_endian",
-                          "scale": 0.1,
-                          "offset": 0.0,
-                          "limits": null,
-                          "unit": "C",
-                          "choices": null,
-                          "display_format": null
-                        }
-                      ]
-                    },
-                    {
-                      "id": 200,
-                      "is_extended_id": false,
-                      "message_name": "motor_stats",
-                      "transmitter": "MAIN_MODULE",
-                      "receivers": [],
-                      "length_bytes": 4,
-                      "nominal_period_ms": 10,
-                      "priority": 2,
-                      "description": "Inverter and motor thermal telemetry",
-                      "signals": [
-                        {
-                          "signal_name": "motor_temp_c",
-                          "description": "Stator winding temperature",
-                          "data_type": "int16_t",
-                          "raw_type": "signed",
-                          "start_bit": 0,
-                          "bit_length": 16,
-                          "byte_order": "little_endian",
-                          "scale": 0.1,
-                          "offset": 0.0,
-                          "limits": null,
-                          "unit": "C",
-                          "choices": null,
-                          "display_format": null
-                        },
-                        {
-                          "signal_name": "inverter_temp_c",
-                          "description": "IGBT module temperature",
-                          "data_type": "int16_t",
-                          "raw_type": "signed",
-                          "start_bit": 16,
-                          "bit_length": 16,
-                          "byte_order": "little_endian",
-                          "scale": 0.1,
-                          "offset": 0.0,
-                          "limits": null,
-                          "unit": "C",
-                          "choices": null,
-                          "display_format": null
-                        }
-                      ]
-                    }
-                  ]
-                }
-              }
-            }"#;
-                daqcore::superdbc::database::Database::from_json(fallback_json)
-                    .expect("valid fallback SuperDBC JSON")
-            });
-        let selection = daqcore::can_thread::BusSelection::default_single(&database)
-            .unwrap_or(daqcore::can_thread::BusSelection::Single(0));
-        app::DatabaseSelection {
-            database,
-            selection,
-        }
-    }
-
     #[test]
     fn signal_browser_and_drag_targets_render_and_configure_cleanly() {
-        let db_sel = sample_database_selection();
-
         let t0 = daqcore::time::Time::from_unix_millis(1_788_719_789_000);
         let mut router =
             daqcore::router::VirtualTimelineRouter::live(t0, 30.0).expect("live router");
@@ -1001,26 +1058,28 @@ mod tests {
             &ctx,
             crate::ui::theme::ThemeSelection::default().get_colors(),
         );
-        let raw_input = eframe::egui::RawInput {
-            screen_rect: Some(eframe::egui::Rect::from_min_size(
-                eframe::egui::Pos2::ZERO,
-                eframe::egui::vec2(420.0, 720.0),
-            )),
-            ..Default::default()
-        };
-        let _ = ctx.run(raw_input, |ctx| {
-            eframe::egui::CentralPanel::default().show(ctx, |ui| {
-                show_signal_browser(
-                    ui,
+        for tree_mode in [false, true] {
+            state.tree_mode = tree_mode;
+            let raw_input = eframe::egui::RawInput {
+                screen_rect: Some(eframe::egui::Rect::from_min_size(
+                    eframe::egui::Pos2::ZERO,
+                    eframe::egui::vec2(420.0, 720.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(raw_input, |ctx| {
+                eframe::egui::CentralPanel::default().show(ctx, |ui| {
+                    show_signal_browser(ui, &mut state, &mut router, &mut action_queue, &mut diag);
+                });
+                show_formula_editor_modal(
+                    ctx,
                     &mut state,
-                    Some(&db_sel),
                     &mut router,
                     &mut action_queue,
                     &mut diag,
                 );
             });
-            show_formula_editor_modal(ctx, &mut state, &mut router, &mut action_queue, &mut diag);
-        });
+        }
 
         let dragged = DraggedSignal::Derived {
             signal_id: "dc_bus_power_kw".to_owned(),
@@ -1041,12 +1100,16 @@ mod tests {
             gps.overlay_signal(),
             Some(&("dc_bus_power_kw".to_owned(), "kW".to_owned()))
         );
+        assert_eq!(format_sidebar_value(0.0), "0");
+        assert_eq!(format_sidebar_value(-0.0), "0");
+        assert_eq!(format_sidebar_value(504.59), "504.59");
+        assert_eq!(format_sidebar_value(3633.05), "3633.1");
+        assert_eq!(format_sidebar_value(0.352), "0.352");
+        assert_eq!(format_sidebar_value(f64::NAN), "");
     }
 
     #[test]
     fn sidebar_width_remains_stable_across_frames_when_searching() {
-        let db_sel = sample_database_selection();
-
         let t0 = daqcore::time::Time::from_unix_millis(1_788_719_789_000);
         let mut router =
             daqcore::router::VirtualTimelineRouter::live(t0, 30.0).expect("live router");
@@ -1098,21 +1161,9 @@ mod tests {
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 ui.set_max_width(ui.available_width());
-                                ui.horizontal(|ui| {
-                                    ui.add(
-                                        eframe::egui::Image::from_bytes(
-                                            crate::assets::PER_LOGO_PATH,
-                                            crate::assets::PER_LOGO_BYTES,
-                                        )
-                                        .show_loading_spinner(true)
-                                        .corner_radius(5),
-                                    );
-                                    ui.heading("Side bar");
-                                });
                                 show_signal_browser(
                                     ui,
                                     &mut state,
-                                    Some(&db_sel),
                                     &mut router,
                                     &mut action_queue,
                                     &mut diag,
@@ -1139,6 +1190,122 @@ mod tests {
             (last_w - first_w).abs() < 1.0,
             "Sidebar width crept from {first_w} to {last_w} across 40 frames: {widths:?}"
         );
+    }
+
+    #[test]
+    fn right_click_formula_row_opens_context_menu_and_edit_modal() {
+        let t0 = daqcore::time::Time::from_unix_millis(1_788_719_789_000);
+        let mut router =
+            daqcore::router::VirtualTimelineRouter::live(t0, 30.0).expect("live router");
+        let mut state = SignalBrowserState::default();
+        let mut action_queue = Vec::new();
+        let mut diag = None;
+
+        let ctx = eframe::egui::Context::default();
+        egui_extras::install_image_loaders(&ctx);
+        crate::ui::theme::store_theme(
+            &ctx,
+            crate::ui::theme::ThemeSelection::default().get_colors(),
+        );
+
+        let formula_id = router
+            .formula_engine_mut()
+            .definitions()
+            .first()
+            .expect("builtin formula")
+            .def
+            .id
+            .clone();
+
+        let mut formula_center = None;
+        let mut edit_btn_center = None;
+
+        for frame in 0..8 {
+            let mut events = Vec::new();
+            if frame == 2 {
+                let pos = formula_center.expect("formula row rect from frame 1");
+                events.push(eframe::egui::Event::PointerMoved(pos));
+                events.push(eframe::egui::Event::PointerButton {
+                    pos,
+                    button: eframe::egui::PointerButton::Secondary,
+                    pressed: true,
+                    modifiers: eframe::egui::Modifiers::NONE,
+                });
+            } else if frame == 3 {
+                let pos = formula_center.expect("formula row rect");
+                events.push(eframe::egui::Event::PointerButton {
+                    pos,
+                    button: eframe::egui::PointerButton::Secondary,
+                    pressed: false,
+                    modifiers: eframe::egui::Modifiers::NONE,
+                });
+            } else if frame == 5 {
+                let pos = edit_btn_center.expect("Edit Formula button rect from frame 4");
+                events.push(eframe::egui::Event::PointerMoved(pos));
+                events.push(eframe::egui::Event::PointerButton {
+                    pos,
+                    button: eframe::egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: eframe::egui::Modifiers::NONE,
+                });
+            } else if frame == 6 {
+                let pos = edit_btn_center.expect("Edit Formula button rect");
+                events.push(eframe::egui::Event::PointerButton {
+                    pos,
+                    button: eframe::egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: eframe::egui::Modifiers::NONE,
+                });
+            }
+
+            let raw_input = eframe::egui::RawInput {
+                screen_rect: Some(eframe::egui::Rect::from_min_size(
+                    eframe::egui::Pos2::ZERO,
+                    eframe::egui::vec2(1280.0, 720.0),
+                )),
+                time: Some(frame as f64 * 0.016),
+                events,
+                ..Default::default()
+            };
+            let output = ctx.run(raw_input, |ctx| {
+                eframe::egui::SidePanel::left("left_sidebar")
+                    .default_width(310.0)
+                    .show(ctx, |ui| {
+                        show_signal_browser(
+                            ui,
+                            &mut state,
+                            &mut router,
+                            &mut action_queue,
+                            &mut diag,
+                        );
+                    });
+            });
+
+            if frame == 1 {
+                for prim in &output.shapes {
+                    if let eframe::egui::epaint::Shape::Text(text) = &prim.shape
+                        && text.galley.text() == formula_id
+                    {
+                        formula_center = Some(prim.shape.visual_bounding_rect().center());
+                    }
+                }
+            }
+            if frame == 4 {
+                for prim in &output.shapes {
+                    if let eframe::egui::epaint::Shape::Text(text) = &prim.shape
+                        && text.galley.text().contains("Edit Formula")
+                    {
+                        edit_btn_center = Some(prim.shape.visual_bounding_rect().center());
+                    }
+                }
+            }
+        }
+
+        let draft = state
+            .formula_draft
+            .expect("Right-clicking formula row and clicking Edit Formula should open draft");
+        assert_eq!(draft.id, formula_id);
+        assert!(draft.is_editing_existing);
     }
 
     #[test]
@@ -1201,5 +1368,225 @@ mod tests {
                 }
             });
         });
+    }
+
+    #[test]
+    fn historical_viewport_filtering_works_without_superdbc() {
+        let store_dir = tempfile::tempdir().expect("temp store dir");
+
+        // Use a temporary SuperDBC ONLY during initial log import (simulating LogParser),
+        // then drop it before opening the store in VirtualTimelineRouter / UI widgets.
+        {
+            let import_db = daqcore::superdbc::database::Database::from_json(
+                r#"{
+                  "content_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                  "versions": { "schema_version": "1.1", "hash": "test_v1" },
+                  "buses": {
+                    "Main": {
+                      "bus_id": 0,
+                      "baud_rate": 500000,
+                      "nodes": [{ "name": "VCU", "is_external": false }],
+                      "messages": [
+                        {
+                          "id": 257,
+                          "is_extended_id": false,
+                          "message_name": "msg_alpha",
+                          "transmitter": "VCU",
+                          "receivers": [],
+                          "length_bytes": 4,
+                          "nominal_period_ms": 10,
+                          "priority": 1,
+                          "description": "Alpha message",
+                          "signals": [
+                            {
+                              "signal_name": "sig_a",
+                              "description": "Alpha voltage",
+                              "data_type": "uint16_t",
+                              "raw_type": "unsigned",
+                              "start_bit": 0,
+                              "bit_length": 16,
+                              "byte_order": "little_endian",
+                              "scale": 0.1,
+                              "offset": 0.0,
+                              "limits": null,
+                              "unit": "V",
+                              "choices": null,
+                              "display_format": null
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    "Accum": {
+                      "bus_id": 1,
+                      "baud_rate": 500000,
+                      "nodes": [{ "name": "BMS", "is_external": false }],
+                      "messages": [
+                        {
+                          "id": 514,
+                          "is_extended_id": false,
+                          "message_name": "msg_beta",
+                          "transmitter": "BMS",
+                          "receivers": [],
+                          "length_bytes": 4,
+                          "nominal_period_ms": 50,
+                          "priority": 1,
+                          "description": "Beta message",
+                          "signals": [
+                            {
+                              "signal_name": "sig_b",
+                              "description": "Beta temperature",
+                              "data_type": "uint16_t",
+                              "raw_type": "unsigned",
+                              "start_bit": 0,
+                              "bit_length": 16,
+                              "byte_order": "little_endian",
+                              "scale": 1.0,
+                              "offset": 0.0,
+                              "limits": null,
+                              "unit": "C",
+                              "choices": null,
+                              "display_format": null
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  }
+                }"#,
+            )
+            .expect("parse import_db");
+
+            let payload_a = import_db.encode(0, 257, &[("sig_a", 42.5)]).unwrap();
+            let decoded_a = import_db.decode(0, 257, &payload_a).unwrap();
+            let payload_b = import_db.encode(1, 514, &[("sig_b", 88.0)]).unwrap();
+            let decoded_b = import_db.decode(1, 514, &payload_b).unwrap();
+
+            let log_files = vec![
+                daqcore::log_parse::parse::SourceLogFile {
+                    file_name: "log-2026-09-06--10-00-00.log".to_owned(),
+                    sha256_hex: "11111111".repeat(8),
+                    rtc_timestamp_ms: Some(1_000),
+                    mtime_unix_ms: 1_000,
+                },
+                daqcore::log_parse::parse::SourceLogFile {
+                    file_name: "log-2026-09-06--10-00-20.log".to_owned(),
+                    sha256_hex: "22222222".repeat(8),
+                    rtc_timestamp_ms: Some(20_000),
+                    mtime_unix_ms: 20_000,
+                },
+            ];
+
+            let epochs = vec![
+                daqcore::log_parse::correlate::CorrelationChunkResult {
+                    parsed_msgs: vec![daqcore::log_parse::parse::ParsedMessage {
+                        timestamp: 500,
+                        bus_name: "Main".to_owned(),
+                        source_file_idx: 0,
+                        decoded: decoded_a,
+                    }],
+                    clock_mapping: daqcore::log_parse::correlate::ClockMapping {
+                        slope: 1.0,
+                        intercept_ms: 1_000.0,
+                        confidence: daqcore::log_parse::correlate::ClockConfidence::RtcEstimated,
+                    },
+                },
+                daqcore::log_parse::correlate::CorrelationChunkResult {
+                    parsed_msgs: vec![daqcore::log_parse::parse::ParsedMessage {
+                        timestamp: 1_000,
+                        bus_name: "Accum".to_owned(),
+                        source_file_idx: 1,
+                        decoded: decoded_b,
+                    }],
+                    clock_mapping: daqcore::log_parse::correlate::ClockMapping {
+                        slope: 1.0,
+                        intercept_ms: 20_000.0,
+                        confidence: daqcore::log_parse::correlate::ClockConfidence::RtcEstimated,
+                    },
+                },
+            ];
+
+            daqcore::storage::write_correlated_epochs_to_store(
+                store_dir.path(),
+                &log_files,
+                epochs,
+                &import_db,
+            )
+            .expect("write two partitions to store");
+        }
+
+        // Now attach store and browse/render WITHOUT any SuperDBC loaded
+        let t0 = daqcore::time::Time::from_unix_millis(30_000);
+        let mut router =
+            daqcore::router::VirtualTimelineRouter::live(t0, 5.0).expect("live router");
+        router
+            .attach_store(store_dir.path())
+            .expect("attach store without SuperDBC");
+
+        // 1. Viewport on Partition A ([1_000..=3_000]): only msg_alpha.sig_a is active
+        router.timeline_mut().snap_to_range_ms(1_000, 3_000);
+        let active_a = router.active_signals_in_viewport();
+        assert_eq!(active_a.len(), 1);
+        let meta_a = active_a
+            .iter()
+            .find(|m| m.signal_id == "msg_alpha.sig_a")
+            .expect("msg_alpha.sig_a active");
+        assert_eq!(meta_a.bus_name, "Main");
+        assert_eq!(meta_a.can_id, 257);
+        assert_eq!(meta_a.transmitter, "VCU");
+        assert_eq!(meta_a.nominal_period_ms, Some(10));
+        assert_eq!(meta_a.unit, "V");
+        assert_eq!(meta_a.description, "Alpha voltage");
+        assert!(!active_a.iter().any(|m| m.signal_id == "msg_beta.sig_b"));
+
+        // Render SignalBrowser, ViewerTable, ViewerList, Jitter without any SuperDBC
+        let ctx = eframe::egui::Context::default();
+        crate::ui::theme::store_theme(
+            &ctx,
+            crate::ui::theme::ThemeSelection::default().get_colors(),
+        );
+        let mut browser = SignalBrowserState::default();
+        let mut viewer_table = crate::ui::viewer_table::ViewerTable::new(1);
+        let viewer_list = crate::ui::viewer_list::ViewerList::new(1);
+        let mut jitter = crate::ui::jitter::Jitter::new(1);
+        let mut actions = Vec::new();
+        let mut diag = None;
+        let formatter = None;
+
+        let raw_input = eframe::egui::RawInput {
+            screen_rect: Some(eframe::egui::Rect::from_min_size(
+                eframe::egui::Pos2::ZERO,
+                eframe::egui::vec2(1000.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(raw_input, |ctx| {
+            eframe::egui::CentralPanel::default().show(ctx, |ui| {
+                show_signal_browser(ui, &mut browser, &mut router, &mut actions, &mut diag);
+                let view = crate::workspace_view::WorkspaceDataView::new(&router);
+                let _ = viewer_table.show(ui, &mut actions, &formatter, &view);
+                let _ = viewer_list.show(ui, &formatter, &view);
+                let _ = jitter.show(ui, &view);
+            });
+        });
+
+        // 2. Viewport on Partition B ([20_000..=23_000]): only msg_beta.sig_b is active
+        router.timeline_mut().snap_to_range_ms(20_000, 23_000);
+        let active_b = router.active_signals_in_viewport();
+        assert_eq!(active_b.len(), 1);
+        let meta_b = active_b
+            .iter()
+            .find(|m| m.signal_id == "msg_beta.sig_b")
+            .expect("msg_beta.sig_b active");
+        assert_eq!(meta_b.bus_name, "Accum");
+        assert_eq!(meta_b.can_id, 514);
+        assert_eq!(meta_b.transmitter, "BMS");
+        assert_eq!(meta_b.nominal_period_ms, Some(50));
+        assert_eq!(meta_b.unit, "C");
+        assert!(!active_b.iter().any(|m| m.signal_id == "msg_alpha.sig_a"));
+
+        // 3. Viewport on empty gap ([8_000..=12_000]): no signals active
+        router.timeline_mut().snap_to_range_ms(8_000, 12_000);
+        assert!(router.active_signals_in_viewport().is_empty());
     }
 }

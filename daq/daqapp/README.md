@@ -6,11 +6,12 @@ DaqApp is PER's complete trackside data acquisition and analysis desktop applica
 
 - Connects to supported CAN sources and decodes traffic with a selected SuperDBC artifact and CAN bus selection
 - Receives live BeamNG vehicle telemetry through the [DAQApp Lua mod](../beamng/README.md), with built-in signal definitions
-- Displays live signals in configurable tables, lists, scopes, and dashboards
-- Configurable widgets for battery data, bus load, jitter, dynamics GPS, G-G plots, and more
-- Logs all received CAN traffic
-- Run log parsing and correlation tools
-- Fully support for CAN-message sending
+- Displays live and historical signals in configurable tables, lists, multi-unit scopes, state lanes, XY scatter plots, and GPS maps
+- Built-in Subteam Workspace Presets (`daq/daqapp/default_presets/*.daqview.json`) for Vehicle Dynamics, Powertrain, Thermals, Aerodynamics, Sensors & Controls, and Trackside Live Debug
+- Portable `.daqview.json` workspace layouts and compressed `daqview1:...` Slack/Discord share strings with optional time-range and custom formula restoration
+- 3-click Dataset Export Modal (`Parquet`, `CSV`, and MATLAB v5 `.mat`) powered by `daq/config/export_presets.json`
+- Logs all received CAN traffic and imports SD card logs into canonical Arrow Parquet partitions with multi-resolution pyramid tiles
+- Full support for CAN-message sending
 - Hardware-in-the-loop configuration, test running, and results viewing
 - Full PER Bootloader workflow
 

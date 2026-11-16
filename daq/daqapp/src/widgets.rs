@@ -1,4 +1,4 @@
-use crate::{action, app, telemetry, ui, widget_constructor};
+use crate::{action, app, ui, widget_constructor, workspace_view};
 use std::sync::mpsc;
 
 pub enum Widget {
@@ -6,21 +6,19 @@ pub enum Widget {
     ViewerList(ui::viewer_list::ViewerList),
     Bootloader(ui::bootloader::Bootloader),
     Scope(ui::scope::Scope),
+    StateLane(ui::state_lane::StateLane),
+    XYScatter(ui::xy_scatter::XYScatter),
     LogParser(ui::log_parser::LogParser),
     SendUi(ui::send::SendUi),
     BusLoad(ui::bus_load::BusLoad),
-    BatteryVoltage(ui::battery::battery_voltage::BatteryVoltage),
-    BatteryTemps(ui::battery::battery_temps::BatteryTemps),
-    GgPlot(ui::gg_plot::GgPlot),
     GpsPlot(ui::gps_plot::GpsPlot),
-    Dynamics(ui::dynamics::Dynamics),
     Jitter(ui::jitter::Jitter),
     Hil(ui::hil::Hil),
 }
 
 pub struct WidgetContext<'a> {
-    pub view: &'a telemetry::TelemetryView<'a>,
-    pub bus_load: &'a [telemetry::BusLoadSample],
+    pub view: &'a workspace_view::WorkspaceDataView<'a>,
+    pub bus_load: &'a [workspace_view::BusLoadSample],
     pub action_queue: &'a mut Vec<action::AppAction>,
     pub database: Option<&'a app::DatabaseSelection>,
     pub ui_to_can_tx: mpsc::Sender<daqcore::can_thread::CanThreadCommand>,
@@ -34,16 +32,51 @@ impl Widget {
             Widget::ViewerList(w) => &w.title,
             Widget::Bootloader(w) => &w.title,
             Widget::Scope(w) => &w.title,
+            Widget::StateLane(w) => &w.title,
+            Widget::XYScatter(w) => &w.title,
             Widget::LogParser(w) => &w.title,
             Widget::SendUi(w) => &w.title,
             Widget::BusLoad(w) => &w.title,
-            Widget::BatteryVoltage(w) => &w.title,
-            Widget::BatteryTemps(w) => &w.title,
-            Widget::GgPlot(w) => &w.title,
             Widget::GpsPlot(w) => &w.title,
-            Widget::Dynamics(w) => &w.title,
             Widget::Jitter(w) => &w.title,
             Widget::Hil(w) => &w.title,
+        }
+    }
+
+    pub fn set_title(&mut self, new_title: String) {
+        match self {
+            Widget::ViewerTable(w) => w.title = new_title,
+            Widget::ViewerList(w) => w.title = new_title,
+            Widget::Bootloader(w) => w.title = new_title,
+            Widget::Scope(w) => w.set_title(new_title),
+            Widget::StateLane(w) => w.set_title(new_title),
+            Widget::XYScatter(w) => w.set_title(new_title),
+            Widget::LogParser(w) => w.title = new_title,
+            Widget::SendUi(w) => w.title = new_title,
+            Widget::BusLoad(w) => w.title = new_title,
+            Widget::GpsPlot(w) => w.set_title(new_title),
+            Widget::Jitter(w) => w.title = new_title,
+            Widget::Hil(w) => w.title = new_title,
+        }
+    }
+
+    pub fn has_custom_title(&self) -> bool {
+        match self {
+            Widget::Scope(w) => w.is_custom_title(),
+            Widget::StateLane(w) => w.is_custom_title(),
+            Widget::XYScatter(w) => w.is_custom_title(),
+            Widget::GpsPlot(w) => w.is_custom_title(),
+            _ => false,
+        }
+    }
+
+    pub fn reset_auto_title(&mut self) {
+        match self {
+            Widget::Scope(w) => w.reset_auto_title(),
+            Widget::StateLane(w) => w.reset_auto_title(),
+            Widget::XYScatter(w) => w.reset_auto_title(),
+            Widget::GpsPlot(w) => w.reset_auto_title(),
+            _ => {}
         }
     }
 
@@ -53,14 +86,12 @@ impl Widget {
             Widget::ViewerList(_) => widget_constructor::WidgetKind::ViewerList,
             Widget::Bootloader(_) => widget_constructor::WidgetKind::Bootloader,
             Widget::Scope(_) => widget_constructor::WidgetKind::Scope,
+            Widget::StateLane(_) => widget_constructor::WidgetKind::StateLane,
+            Widget::XYScatter(_) => widget_constructor::WidgetKind::XYScatter,
             Widget::LogParser(_) => widget_constructor::WidgetKind::LogParser,
             Widget::SendUi(_) => widget_constructor::WidgetKind::SendUi,
             Widget::BusLoad(_) => widget_constructor::WidgetKind::BusLoad,
-            Widget::BatteryVoltage(_) => widget_constructor::WidgetKind::BatteryVoltage,
-            Widget::BatteryTemps(_) => widget_constructor::WidgetKind::BatteryTemps,
-            Widget::GgPlot(_) => widget_constructor::WidgetKind::GgPlot,
             Widget::GpsPlot(_) => widget_constructor::WidgetKind::GpsPlot,
-            Widget::Dynamics(_) => widget_constructor::WidgetKind::Dynamics,
             Widget::Jitter(_) => widget_constructor::WidgetKind::Jitter,
             Widget::Hil(_) => widget_constructor::WidgetKind::Hil,
         }
@@ -72,27 +103,21 @@ impl Widget {
         context: WidgetContext<'_>,
     ) -> egui_tiles::UiResponse {
         match self {
-            Widget::ViewerTable(w) => w.show(
-                ui,
-                context.action_queue,
-                context.formatter,
-                context.database,
-                context.view,
-            ),
-            Widget::ViewerList(w) => w.show(ui, context.formatter, context.database, context.view),
+            Widget::ViewerTable(w) => {
+                w.show(ui, context.action_queue, context.formatter, context.view)
+            }
+            Widget::ViewerList(w) => w.show(ui, context.formatter, context.view),
             Widget::Bootloader(w) => w.show(ui, &context.ui_to_can_tx),
-            Widget::Scope(w) => w.show(ui, context.database, context.view),
+            Widget::Scope(w) => w.show(ui, context.view),
+            Widget::StateLane(w) => w.show(ui, context.view),
+            Widget::XYScatter(w) => w.show(ui, context.view),
             Widget::LogParser(w) => {
                 w.show(ui, context.database, context.view, context.action_queue)
             }
             Widget::SendUi(w) => w.show(ui, context.database, context.formatter),
             Widget::BusLoad(w) => w.show(ui, context.bus_load, context.view),
-            Widget::BatteryVoltage(w) => w.show(ui, context.view),
-            Widget::BatteryTemps(w) => w.show(ui, context.view),
-            Widget::GgPlot(w) => w.show(ui, context.view),
             Widget::GpsPlot(w) => w.show(ui, context.view),
-            Widget::Dynamics(w) => w.show(ui, context.view),
-            Widget::Jitter(w) => w.show(ui, context.database, context.view),
+            Widget::Jitter(w) => w.show(ui, context.view),
             Widget::Hil(w) => w.show(ui),
         }
     }
@@ -101,8 +126,6 @@ impl Widget {
         match self {
             Widget::SendUi(widget) => widget.reset_database(),
             Widget::Bootloader(widget) => widget.reset_database(),
-            Widget::Scope(widget) => widget.reset_database(),
-            Widget::Jitter(widget) => widget.reset_database(),
             _ => {}
         }
     }

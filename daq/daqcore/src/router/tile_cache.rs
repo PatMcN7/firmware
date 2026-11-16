@@ -1,5 +1,7 @@
 use crate::{
-    router::types::{EnvelopePoint, Resolution, SignalSeries, StateInterval},
+    router::types::{
+        BUCKET_1HZ_MS, BUCKET_10HZ_MS, EnvelopePoint, Resolution, SignalSeries, StateInterval,
+    },
     storage::{self, RegisteredPartition, SignalId},
 };
 use arrow::array::{
@@ -10,7 +12,11 @@ use parquet::arrow::{ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuild
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt, fs, io, path,
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     thread, time,
 };
 
@@ -224,6 +230,7 @@ pub struct TileCache {
     partition_dirs: HashMap<String, path::PathBuf>,
     partition_signals: HashMap<String, HashSet<SignalId>>,
     dynamic: Mutex<TileCacheDynamic>,
+    revision: AtomicU64,
     cmd_tx: mpsc::Sender<WorkerCommand>,
     repaint_cb: Arc<Mutex<Option<RepaintCallback>>>,
     worker_handle: Option<thread::JoinHandle<()>>,
@@ -288,10 +295,17 @@ impl TileCache {
                 in_flight: HashSet::new(),
                 res_rx,
             }),
+            revision: AtomicU64::new(1),
             cmd_tx,
             repaint_cb,
             worker_handle,
         }
+    }
+
+    /// Monotonically increasing revision counter bumped whenever tiles finish loading,
+    /// partitions are preloaded, or the cache is cleared.
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Relaxed)
     }
 
     /// Configure a callback (e.g. `move || ctx.request_repaint()`) invoked whenever the
@@ -336,6 +350,7 @@ impl TileCache {
             dyn_guard.lru.clear();
             dyn_guard.in_flight.clear();
         }
+        self.revision.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Return the preloaded 1Hz sample-count activity buckets `(bucket_utc_ms, count)` for a partition.
@@ -388,11 +403,13 @@ impl TileCache {
             .insert(partition_id.to_owned(), Arc::new(activity_1hz));
         self.resident_states
             .insert(partition_id.to_owned(), states_map);
+        self.revision.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
     }
 
-    /// Preload all local partitions in `partitions` from `<store_dir>/<relative_path>`.
+    /// Preload all partitions in `partitions` that have `overview_1hz.parquet` present in
+    /// `<store_dir>/<relative_path>` (including remote partitions whose 1Hz overview has been prefetched).
     pub fn preload_registered_partitions(
         &mut self,
         store_dir: &path::Path,
@@ -400,14 +417,11 @@ impl TileCache {
     ) -> Result<usize, RouterError> {
         let mut loaded = 0usize;
         for part in partitions {
-            if !part.is_local {
-                continue;
-            }
             if self.resident_1hz.contains_key(&part.partition_id) {
                 continue;
             }
             let part_dir = store_dir.join(&part.relative_path);
-            if part_dir.exists() {
+            if part_dir.join("overview_1hz.parquet").is_file() {
                 self.preload_partition(
                     &part.partition_id,
                     &part_dir,
@@ -425,10 +439,10 @@ impl TileCache {
         let Ok(mut dyn_guard) = self.dynamic.lock() else {
             return 0;
         };
-        Self::poll_completed_locked(&mut dyn_guard)
+        Self::poll_completed_locked(&mut dyn_guard, &self.revision)
     }
 
-    fn poll_completed_locked(dyn_guard: &mut TileCacheDynamic) -> usize {
+    fn poll_completed_locked(dyn_guard: &mut TileCacheDynamic, revision: &AtomicU64) -> usize {
         let mut completed = 0usize;
         while let Ok(msg) = dyn_guard.res_rx.try_recv() {
             dyn_guard.in_flight.remove(&msg.key);
@@ -447,6 +461,9 @@ impl TileCache {
                 }
             }
         }
+        if completed > 0 {
+            revision.fetch_add(1, Ordering::Relaxed);
+        }
         completed
     }
 
@@ -456,7 +473,7 @@ impl TileCache {
             return 0;
         };
         let deadline = time::Instant::now() + timeout;
-        let mut total = Self::poll_completed_locked(&mut dyn_guard);
+        let mut total = Self::poll_completed_locked(&mut dyn_guard, &self.revision);
         while !dyn_guard.in_flight.is_empty() {
             let now = time::Instant::now();
             if now >= deadline {
@@ -469,11 +486,12 @@ impl TileCache {
                     if let Ok(series) = msg.result {
                         dyn_guard.lru.insert(msg.key, series);
                         total += 1;
+                        self.revision.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 Err(_) => break,
             }
-            total += Self::poll_completed_locked(&mut dyn_guard);
+            total += Self::poll_completed_locked(&mut dyn_guard, &self.revision);
         }
         drop(dyn_guard);
         drop(self.repaint_cb.lock());
@@ -507,7 +525,7 @@ impl TileCache {
         let Ok(mut dyn_guard) = self.dynamic.lock() else {
             return resident_1hz.map(TileLookup::Ready);
         };
-        Self::poll_completed_locked(&mut dyn_guard);
+        Self::poll_completed_locked(&mut dyn_guard, &self.revision);
 
         if resolution == Resolution::Overview1Hz {
             return resident_1hz.map(TileLookup::Ready);
@@ -523,14 +541,19 @@ impl TileCache {
             return Some(TileLookup::Ready(cached));
         }
 
-        // Enqueue background read if not already in flight
-        if let Some(partition_dir) = self.partition_dirs.get(partition_id)
-            && dyn_guard.in_flight.insert(key.clone())
-        {
-            let _ = self.cmd_tx.send(WorkerCommand::LoadTile {
-                key,
-                partition_dir: partition_dir.clone(),
-            });
+        // Enqueue background read if the requested Parquet file is present on disk and not already in flight
+        if let Some(partition_dir) = self.partition_dirs.get(partition_id) {
+            let file_exists = match resolution {
+                Resolution::FullRes => partition_dir.join("full_res.parquet").is_file(),
+                Resolution::Overview10Hz => partition_dir.join("overview_10hz.parquet").is_file(),
+                Resolution::Overview1Hz => partition_dir.join("overview_1hz.parquet").is_file(),
+            };
+            if file_exists && dyn_guard.in_flight.insert(key.clone()) {
+                let _ = self.cmd_tx.send(WorkerCommand::LoadTile {
+                    key,
+                    partition_dir: partition_dir.clone(),
+                });
+            }
         }
 
         // Return best available resident fallback immediately
@@ -583,7 +606,7 @@ impl TileCache {
         };
 
         if let Ok(mut dyn_guard) = self.dynamic.lock() {
-            Self::poll_completed_locked(&mut dyn_guard);
+            Self::poll_completed_locked(&mut dyn_guard, &self.revision);
             if let Some(cached) = dyn_guard.lru.get(&key) {
                 return Ok(Some(cached));
             }
@@ -612,6 +635,7 @@ impl TileCache {
 
         if let Ok(mut dyn_guard) = self.dynamic.lock() {
             dyn_guard.lru.insert(key, Arc::clone(&series));
+            self.revision.fetch_add(1, Ordering::Relaxed);
         }
         Ok(Some(series))
     }
@@ -664,6 +688,120 @@ impl TileCache {
             .get(partition_id)
             .and_then(|map| map.get(signal_id))
             .and_then(|series| series.latest_at_or_before(target_utc_ms))
+    }
+
+    /// Check whether `sig_entry` in `partition_id` has at least one sample overlapping `range`
+    /// (`[start_utc_ms..=end_utc_ms]`) using manifest bounds and resident series in RAM.
+    pub fn partition_signal_has_samples_in_range(
+        &self,
+        partition_id: &str,
+        sig_entry: &storage::SignalManifestEntry,
+        range: std::ops::RangeInclusive<i64>,
+    ) -> bool {
+        if range.is_empty() || sig_entry.sample_count == 0 {
+            return false;
+        }
+        let start_ms = *range.start();
+        let end_ms = *range.end();
+        if sig_entry.min_utc_ms > end_ms || sig_entry.max_utc_ms < start_ms {
+            return false;
+        }
+
+        let signal_id = &sig_entry.signal_id;
+        let full_key = TileKey {
+            partition_id: partition_id.to_owned(),
+            signal_id: signal_id.clone(),
+            resolution: Resolution::FullRes,
+        };
+        let key_10hz = TileKey {
+            partition_id: partition_id.to_owned(),
+            signal_id: signal_id.clone(),
+            resolution: Resolution::Overview10Hz,
+        };
+
+        if let Ok(dyn_guard) = self.dynamic.lock() {
+            if let Some(series) = dyn_guard.lru.peek(&full_key) {
+                return series.has_points_in_range(start_ms..=end_ms);
+            }
+            if let Some(series) = dyn_guard.lru.peek(&key_10hz) {
+                let lo_10hz = start_ms
+                    .div_euclid(BUCKET_10HZ_MS)
+                    .saturating_mul(BUCKET_10HZ_MS);
+                return series.has_points_in_range(lo_10hz..=end_ms);
+            }
+        }
+
+        if let Some(map_1hz) = self.resident_1hz.get(partition_id) {
+            let lo_1hz = start_ms
+                .div_euclid(BUCKET_1HZ_MS)
+                .saturating_mul(BUCKET_1HZ_MS);
+            if let Some(series) = map_1hz.get(signal_id)
+                && series.has_points_in_range(lo_1hz..=end_ms)
+            {
+                return true;
+            }
+            if let Some(states) = self
+                .resident_states
+                .get(partition_id)
+                .and_then(|m| m.get(signal_id))
+                && states.iter().any(|iv| iv.overlaps(&range))
+            {
+                return true;
+            }
+            return false;
+        }
+
+        true
+    }
+
+    /// Peek the newest sample `(utc_ms, value)` within `range` (`[start_utc_ms..=end_utc_ms]`)
+    /// using the highest-resolution resident series currently in RAM without blocking.
+    pub fn latest_resident_in_range(
+        &self,
+        partition_id: &str,
+        signal_id: &str,
+        range: std::ops::RangeInclusive<i64>,
+    ) -> Option<(i64, f64)> {
+        if range.is_empty() {
+            return None;
+        }
+        let start_ms = *range.start();
+        let end_ms = *range.end();
+
+        let full_key = TileKey {
+            partition_id: partition_id.to_owned(),
+            signal_id: signal_id.to_owned(),
+            resolution: Resolution::FullRes,
+        };
+        let key_10hz = TileKey {
+            partition_id: partition_id.to_owned(),
+            signal_id: signal_id.to_owned(),
+            resolution: Resolution::Overview10Hz,
+        };
+
+        if let Ok(dyn_guard) = self.dynamic.lock() {
+            if let Some(series) = dyn_guard.lru.peek(&full_key) {
+                let (t, v) = series.latest_at_or_before(end_ms)?;
+                return (t >= start_ms).then_some((t, v));
+            }
+            if let Some(series) = dyn_guard.lru.peek(&key_10hz) {
+                let lo_10hz = start_ms
+                    .div_euclid(BUCKET_10HZ_MS)
+                    .saturating_mul(BUCKET_10HZ_MS);
+                let (t, v) = series.latest_at_or_before(end_ms)?;
+                return (t >= lo_10hz).then_some((t.max(start_ms), v));
+            }
+        }
+
+        let lo_1hz = start_ms
+            .div_euclid(BUCKET_1HZ_MS)
+            .saturating_mul(BUCKET_1HZ_MS);
+        let (t, v) = self
+            .resident_1hz
+            .get(partition_id)
+            .and_then(|map| map.get(signal_id))
+            .and_then(|series| series.latest_at_or_before(end_ms))?;
+        (t >= lo_1hz).then_some((t.max(start_ms), v))
     }
 }
 

@@ -308,6 +308,7 @@ impl Registry {
             }
             conn.run_pending_migrations(MIGRATIONS)
                 .map_err(RegistryError::Migration)?;
+            Self::renumber_auto_stints_in_conn(&mut conn, None)?;
         }
 
         Ok(Self { pool })
@@ -315,6 +316,25 @@ impl Registry {
 
     pub fn pool(&self) -> &DbPool {
         &self.pool
+    }
+
+    /// Flush and truncate the SQLite write-ahead log (`PRAGMA wal_checkpoint(TRUNCATE);`)
+    /// so the main `.sqlite` file on disk is completely self-contained.
+    pub fn checkpoint_wal(&self) -> Result<(), RegistryError> {
+        let mut conn = self.pool.get()?;
+        conn.batch_execute("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
+    }
+
+    /// Return `true` when all canonical Parquet pyramid files (`manifest.json`,
+    /// `overview_1hz.parquet`, `overview_10hz.parquet`, `full_res.parquet`, and `states.parquet`)
+    /// are present on disk in `partition_dir`.
+    pub fn is_partition_dir_complete(partition_dir: &path::Path) -> bool {
+        partition_dir.join("manifest.json").is_file()
+            && partition_dir.join("overview_1hz.parquet").is_file()
+            && partition_dir.join("overview_10hz.parquet").is_file()
+            && partition_dir.join("full_res.parquet").is_file()
+            && partition_dir.join("states.parquet").is_file()
     }
 
     /// Scan `<store_dir>/partitions/*/manifest.json` and ensure all on-disk partitions
@@ -343,7 +363,8 @@ impl Registry {
             }
             let bytes = fs::read(&manifest_path)?;
             let manifest: PartitionManifest = serde_json::from_slice(&bytes)?;
-            if self.register_manifest(&manifest, true)? {
+            let is_complete = Self::is_partition_dir_complete(&dir);
+            if self.register_manifest(&manifest, is_complete)? {
                 newly_inserted += 1;
             }
         }
@@ -421,6 +442,62 @@ impl Registry {
         };
 
         Ok(TrackDay::from(row))
+    }
+
+    /// Explicitly set (or clear when `label` is empty) the human-readable label (`location` and `title`)
+    /// for `track_day_id`.
+    pub fn set_track_day_label(
+        &self,
+        track_day_id: &str,
+        label: &str,
+    ) -> Result<TrackDay, RegistryError> {
+        let trimmed = label.trim();
+        let title = if trimmed.is_empty() {
+            default_track_day_title(track_day_id)
+        } else {
+            format!("{track_day_id} — {trimmed}")
+        };
+        let location = trimmed.to_owned();
+
+        let mut conn = self.pool.get()?;
+        conn.immediate_transaction(|conn| {
+            let existing = track_days::table
+                .filter(track_days::id.eq(track_day_id))
+                .select(TrackDayRow::as_select())
+                .first::<TrackDayRow>(conn)
+                .optional()?;
+
+            let row = match existing {
+                Some(prev) => {
+                    let updated = TrackDayRow {
+                        id: prev.id,
+                        title,
+                        location,
+                        start_utc_ms: prev.start_utc_ms,
+                        end_utc_ms: prev.end_utc_ms,
+                    };
+                    diesel::update(track_days::table.filter(track_days::id.eq(track_day_id)))
+                        .set(&updated)
+                        .execute(conn)?;
+                    updated
+                }
+                None => {
+                    let inserted = TrackDayRow {
+                        id: track_day_id.to_owned(),
+                        title,
+                        location,
+                        start_utc_ms: 0,
+                        end_utc_ms: 0,
+                    };
+                    diesel::insert_into(track_days::table)
+                        .values(&inserted)
+                        .execute(conn)?;
+                    inserted
+                }
+            };
+            Ok::<_, diesel::result::Error>(TrackDay::from(row))
+        })
+        .map_err(RegistryError::from)
     }
 
     pub fn get_track_day(&self, track_day_id: &str) -> Result<Option<TrackDay>, RegistryError> {
@@ -556,11 +633,27 @@ impl Registry {
             }
 
             for annotation in &manifest.annotations {
-                Self::upsert_annotation_in_conn(conn, annotation)?;
+                Self::upsert_annotation_in_conn(conn, annotation, true)?;
             }
+
+            Self::renumber_auto_stints_in_conn(conn, Some(&manifest.track_day_id))?;
 
             Ok(was_newly_inserted)
         })
+    }
+
+    pub fn list_all_partitions(&self) -> Result<Vec<RegisteredPartition>, RegistryError> {
+        let mut conn = self.pool.get()?;
+        let rows = partitions::table
+            .order((
+                partitions::start_utc_ms.asc(),
+                partitions::partition_id.asc(),
+            ))
+            .select(PartitionRow::as_select())
+            .load::<PartitionRow>(&mut conn)?;
+        rows.into_iter()
+            .map(PartitionRow::into_registered)
+            .collect()
     }
 
     pub fn list_partitions_for_day(
@@ -656,7 +749,7 @@ impl Registry {
                 end_utc_ms,
             };
             Self::upsert_track_day_in_conn(conn, &day)?;
-            Self::upsert_annotation_in_conn(conn, annotation)
+            Self::upsert_annotation_in_conn(conn, annotation, false)
         })
         .map_err(RegistryError::from)
     }
@@ -756,6 +849,7 @@ impl Registry {
     fn upsert_annotation_in_conn(
         conn: &mut SqliteConnection,
         annotation: &Annotation,
+        from_manifest: bool,
     ) -> Result<bool, diesel::result::Error> {
         let existing = annotations::table
             .filter(annotations::id.eq(&annotation.id))
@@ -763,7 +857,7 @@ impl Registry {
             .first::<AnnotationRow>(conn)
             .optional()?;
 
-        let row = AnnotationRow::from(annotation);
+        let mut row = AnnotationRow::from(annotation);
         match existing {
             None => {
                 diesel::insert_into(annotations::table)
@@ -772,10 +866,40 @@ impl Registry {
                 Ok(true)
             }
             Some(prev) => {
-                // Auto-annotations are deterministic; never overwrite an existing row on re-import
-                // so manual edits, promotions to "manual", and soft-deletes are always preserved.
-                if annotation.source == "auto" {
+                // Auto-annotations from partition manifests are deterministic; never overwrite an
+                // existing row on re-import so manual edits, promotions to "manual", and
+                // soft-deletes are always preserved.
+                if from_manifest && annotation.source == "auto" {
                     return Ok(false);
+                }
+                if annotation.deleted {
+                    if annotation.updated_at_ms < prev.updated_at_ms {
+                        return Ok(false);
+                    }
+                    diesel::update(annotations::table.filter(annotations::id.eq(&annotation.id)))
+                        .set(&row)
+                        .execute(conn)?;
+                    return Ok(true);
+                }
+                if annotation.source == "auto" {
+                    if prev.deleted || prev.source == "manual" {
+                        return Ok(false);
+                    }
+                    let content_changed = row.name != prev.name
+                        || row.category != prev.category
+                        || row.color != prev.color
+                        || row.start_utc_ms != prev.start_utc_ms
+                        || row.end_utc_ms != prev.end_utc_ms
+                        || row.notes != prev.notes
+                        || row.deleted != prev.deleted;
+                    if !content_changed {
+                        return Ok(false);
+                    }
+                    // Direct upsert of a modified auto-annotation promotes it to "manual".
+                    row.source = "manual".to_owned();
+                    if row.author == "daqcore" || row.author == "auto" || row.author.is_empty() {
+                        row.author = "user".to_owned();
+                    }
                 }
                 if annotation.updated_at_ms < prev.updated_at_ms {
                     return Ok(false);
@@ -786,6 +910,69 @@ impl Registry {
                 Ok(true)
             }
         }
+    }
+
+    /// Renumber active auto-detected driving stints sequentially (`Driving Stint #1`, `#2`, ...)
+    /// chronologically within each Track Day so numbering continues across partitions instead of
+    /// restarting at `#1` in every partition.
+    fn renumber_auto_stints_in_conn(
+        conn: &mut SqliteConnection,
+        track_day_filter: Option<&str>,
+    ) -> Result<(), diesel::result::Error> {
+        let mut query = annotations::table
+            .filter(
+                annotations::category
+                    .eq("driving_stint")
+                    .or(annotations::id.like("auto_stint_%")),
+            )
+            .filter(annotations::deleted.eq(false))
+            .into_boxed();
+        if let Some(day_id) = track_day_filter {
+            query = query.filter(annotations::track_day_id.eq(day_id));
+        }
+
+        let rows = query
+            .order((
+                annotations::track_day_id.asc(),
+                annotations::start_utc_ms.asc(),
+                annotations::id.asc(),
+            ))
+            .select(AnnotationRow::as_select())
+            .load::<AnnotationRow>(conn)?;
+
+        let mut current_day: Option<String> = None;
+        let mut stint_idx: usize = 0;
+
+        for row in rows {
+            let is_default_auto_name =
+                row.name
+                    .strip_prefix("Driving Stint #")
+                    .is_some_and(|suffix| {
+                        !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit())
+                    });
+            let is_auto_origin =
+                row.id.starts_with("auto_stint_") || (row.source == "auto" && is_default_auto_name);
+            if !is_auto_origin {
+                continue;
+            }
+            if current_day.as_deref() != Some(row.track_day_id.as_str()) {
+                current_day = Some(row.track_day_id.clone());
+                stint_idx = 1;
+            } else {
+                stint_idx += 1;
+            }
+            if row.source != "auto" || !is_default_auto_name {
+                continue;
+            }
+            let expected_name = format!("Driving Stint #{stint_idx}");
+            if row.name != expected_name {
+                diesel::update(annotations::table.filter(annotations::id.eq(&row.id)))
+                    .set(annotations::name.eq(&expected_name))
+                    .execute(conn)?;
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -823,6 +1010,12 @@ mod tests {
                 signal_id: "imu.accel_y_g".to_owned(),
                 unit: "g".to_owned(),
                 is_discrete: false,
+                bus_name: "VCAN".to_owned(),
+                bus_id: 0,
+                can_id: 100,
+                transmitter: "MAIN_MODULE".to_owned(),
+                nominal_period_ms: Some(10),
+                description: "Lateral acceleration".to_owned(),
                 sample_count: 100,
                 min_utc_ms: start_utc_ms,
                 max_utc_ms: end_utc_ms,
@@ -1063,5 +1256,166 @@ mod tests {
         assert_eq!(delta[0].id, "auto_stint_p1_110000");
         assert_eq!(delta[1].id, "auto_fault_p1_140000");
         assert!(delta[1].deleted);
+    }
+
+    #[test]
+    fn test_auto_stints_are_uniquely_numbered_across_partitions_in_track_day() {
+        let registry = Registry::open_in_memory().expect("in-memory registry");
+
+        let make_stint = |part_id: &str, idx: usize, start_ms: i64, end_ms: i64| Annotation {
+            id: format!("auto_stint_{part_id}_{start_ms}"),
+            track_day_id: "2026-09-06".to_owned(),
+            name: format!("Driving Stint #{idx}"),
+            category: "driving_stint".to_owned(),
+            color: "#22c55e".to_owned(),
+            start_utc_ms: start_ms,
+            end_utc_ms: Some(end_ms),
+            author: "daqcore".to_owned(),
+            source: "auto".to_owned(),
+            notes: String::new(),
+            updated_at_ms: 100,
+            deleted: false,
+        };
+
+        // Register later partition FIRST to verify chronological ordering works regardless of import order
+        let m2 = sample_manifest(
+            "p2",
+            "2026-09-06",
+            200_000,
+            290_000,
+            "hash_p2",
+            vec![
+                make_stint("p2", 1, 210_000, 230_000),
+                make_stint("p2", 2, 250_000, 280_000),
+            ],
+        );
+        registry.register_manifest(&m2, true).unwrap();
+
+        let m1 = sample_manifest(
+            "p1",
+            "2026-09-06",
+            100_000,
+            190_000,
+            "hash_p1",
+            vec![
+                make_stint("p1", 1, 110_000, 140_000),
+                make_stint("p1", 2, 160_000, 180_000),
+            ],
+        );
+        registry.register_manifest(&m1, true).unwrap();
+
+        let day_anns = registry
+            .list_annotations_for_day("2026-09-06", false)
+            .unwrap();
+        let names: Vec<&str> = day_anns.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "Driving Stint #1",
+                "Driving Stint #2",
+                "Driving Stint #3",
+                "Driving Stint #4",
+            ]
+        );
+
+        // Editing an auto-generated driving stint label (even if caller leaves source == "auto")
+        // must persist the custom label, promote source to "manual", and preserve the numbering
+        // of remaining auto-detected stints on subsequent re-imports.
+        let mut edited_stint_1 = day_anns[0].clone();
+        edited_stint_1.name = "Warmup / Brake Bedding".to_owned();
+        assert!(registry.upsert_annotation(&edited_stint_1).unwrap());
+
+        let mut edited_stint_2 = day_anns[1].clone();
+        edited_stint_2.name = "Driving Stint #2 - Aero Sweep".to_owned();
+        assert!(registry.upsert_annotation(&edited_stint_2).unwrap());
+
+        registry.register_manifest(&m1, true).unwrap();
+        registry.register_manifest(&m2, true).unwrap();
+
+        let after_edit = registry
+            .list_annotations_for_day("2026-09-06", false)
+            .unwrap();
+        let edited_names: Vec<&str> = after_edit.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            edited_names,
+            vec![
+                "Warmup / Brake Bedding",
+                "Driving Stint #2 - Aero Sweep",
+                "Driving Stint #3",
+                "Driving Stint #4",
+            ]
+        );
+        assert_eq!(after_edit[0].source, "manual");
+        assert_eq!(after_edit[1].source, "manual");
+    }
+
+    #[test]
+    fn test_sync_from_store_dir_incomplete_vs_complete_and_tombstone_sync() {
+        let tmp = tempfile::tempdir().expect("temp store dir");
+        let part_dir = tmp.path().join("partitions").join("epoch_500000_cloud");
+        fs::create_dir_all(&part_dir).unwrap();
+
+        let auto_ann = Annotation {
+            id: "auto_stint_cloud_510000".to_owned(),
+            track_day_id: "2026-11-12".to_owned(),
+            name: "Driving Stint #1".to_owned(),
+            category: "driving_stint".to_owned(),
+            color: "#22c55e".to_owned(),
+            start_utc_ms: 510_000,
+            end_utc_ms: Some(580_000),
+            author: "daqcore".to_owned(),
+            source: "auto".to_owned(),
+            notes: String::new(),
+            updated_at_ms: 100,
+            deleted: false,
+        };
+        let manifest = sample_manifest(
+            "epoch_500000_cloud",
+            "2026-11-12",
+            500_000,
+            600_000,
+            "hash_cloud",
+            vec![auto_ann.clone()],
+        );
+        fs::write(
+            part_dir.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(part_dir.join("overview_1hz.parquet"), b"dummy").unwrap();
+        fs::write(part_dir.join("states.parquet"), b"dummy").unwrap();
+
+        let registry = Registry::open_store(tmp.path()).unwrap();
+        assert_eq!(registry.sync_from_store_dir(tmp.path()).unwrap(), 1);
+        let part = registry
+            .get_partition("epoch_500000_cloud")
+            .unwrap()
+            .expect("partition registered");
+        assert!(
+            !part.is_local,
+            "partition with only 1Hz overview + states must remain is_local = false"
+        );
+
+        // Once overview_10hz.parquet and full_res.parquet arrive, sync_from_store_dir marks is_local = true
+        fs::write(part_dir.join("overview_10hz.parquet"), b"dummy").unwrap();
+        fs::write(part_dir.join("full_res.parquet"), b"dummy").unwrap();
+        assert_eq!(registry.sync_from_store_dir(tmp.path()).unwrap(), 0);
+        let part_after = registry
+            .get_partition("epoch_500000_cloud")
+            .unwrap()
+            .unwrap();
+        assert!(part_after.is_local);
+        assert_eq!(registry.list_all_partitions().unwrap().len(), 1);
+
+        // Soft-delete tombstone from a remote peer must apply via upsert_annotation even if source == "auto"
+        let mut tombstone = auto_ann;
+        tombstone.deleted = true;
+        tombstone.updated_at_ms = 500;
+        assert!(registry.upsert_annotation(&tombstone).unwrap());
+        let fetched = registry
+            .get_annotation("auto_stint_cloud_510000")
+            .unwrap()
+            .unwrap();
+        assert!(fetched.deleted);
     }
 }

@@ -29,11 +29,8 @@ impl<'a> WorkspaceDataView<'a> {
         hover_distance_m: Option<f64>,
     ) -> Self {
         let timeline = router.timeline();
-        let view_time = if timeline.is_live() {
-            daqcore::time::Time::now()
-        } else {
-            timeline.setpoint()
-        };
+        // Every pane reads the shared playhead, including while following live data.
+        let view_time = timeline.setpoint();
 
         Self {
             router,

@@ -411,7 +411,9 @@ impl MasterTimeline {
     }
 
     pub fn is_live(&self) -> bool {
-        self.setpoint_track == Track::Marching && self.end_track == Track::Marching
+        self.setpoint_track == Track::Marching
+            && self.setpoint == self.latest
+            && self.range().contains(&self.latest)
     }
 
     pub fn range(&self) -> ops::RangeInclusive<time::Time> {
@@ -496,7 +498,15 @@ impl MasterTimeline {
     }
 
     pub fn toggle_playing(&mut self) {
-        self.set_playing(!self.is_playing);
+        if self.is_live() {
+            // Pause live-follow rather than starting historical playback.
+            self.start_track = Track::Frozen;
+            self.end_track = Track::Frozen;
+            self.setpoint_track = Track::Frozen;
+            self.is_playing = false;
+        } else {
+            self.set_playing(!self.is_playing);
+        }
     }
 
     pub fn playback_speed(&self) -> f64 {
@@ -581,6 +591,7 @@ impl MasterTimeline {
     /// Pan the active `[start, end]` window to start at `new_start_ms`, preserving its duration
     /// and the relative offset of `setpoint` inside the window.
     pub fn pan_to_start_ms(&mut self, mut new_start_ms: i64) {
+        let was_live = self.is_live();
         let span_ms = self
             .end
             .unix_millis()
@@ -605,6 +616,10 @@ impl MasterTimeline {
         self.end_track = Track::Frozen;
         self.setpoint_track = Track::Frozen;
         self.window_ms = span_ms;
+        if was_live && self.range().contains(&self.latest) {
+            self.setpoint_track = Track::Marching;
+            self.recompute();
+        }
     }
 
     /// Smoothly zoom `[start, end]` around `anchor_utc_ms` by `zoom_factor`
@@ -613,6 +628,7 @@ impl MasterTimeline {
         if !zoom_factor.is_finite() || zoom_factor <= 0.0 {
             return;
         }
+        let was_live = self.is_live();
         let cur_start = self.start.unix_millis();
         let cur_end = self.end.unix_millis();
         let cur_span = cur_end.saturating_sub(cur_start).max(MIN_WINDOW_MS);
@@ -641,6 +657,10 @@ impl MasterTimeline {
         self.end_track = Track::Frozen;
         self.setpoint_track = Track::Frozen;
         self.window_ms = new_span;
+        if was_live && self.range().contains(&self.latest) {
+            self.setpoint_track = Track::Marching;
+            self.recompute();
+        }
     }
 
     pub fn selected_annotation_ids(&self) -> &[String] {
@@ -766,21 +786,27 @@ impl MasterTimeline {
         }
 
         if self.setpoint_track == Track::Marching {
-            self.setpoint = self.end;
+            if self.range().contains(&self.latest) {
+                self.setpoint = self.latest;
+            } else {
+                // The view no longer permits live-follow. Freeze rather than
+                // relocating the playhead to an unrelated viewport edge.
+                self.setpoint = self.setpoint.clamp(self.start, self.end);
+                self.setpoint_track = Track::Frozen;
+            }
         }
 
         before != (self.start, self.end, self.setpoint)
     }
 
     pub fn set_start(&mut self, time: time::Time) {
-        let upper_bound = if self.setpoint_track == Track::Frozen {
-            self.setpoint
-        } else {
-            self.end
-        };
-
-        self.start = time.min(upper_bound);
+        self.start = time.min(self.end);
         self.start_track = Track::Frozen;
+        if self.setpoint < self.start {
+            // The view defines valid cursor positions, not the other way around.
+            self.setpoint = self.start;
+            self.setpoint_track = Track::Frozen;
+        }
         self.recompute();
     }
 
@@ -791,18 +817,26 @@ impl MasterTimeline {
             end = end.max(self.start);
         }
 
-        if self.setpoint_track == Track::Frozen {
-            end = end.max(self.setpoint);
-        }
-
         self.end = end;
         self.end_track = Track::Frozen;
+        if self.setpoint > self.end {
+            self.setpoint = self.end;
+            self.setpoint_track = Track::Frozen;
+        }
         self.recompute();
     }
 
     pub fn set_setpoint(&mut self, time: time::Time) {
+        let was_live = self.is_live();
         self.setpoint = time.clamp(self.start, self.end);
-        self.setpoint_track = Track::Frozen;
+        if !was_live || self.setpoint != self.latest {
+            self.setpoint_track = Track::Frozen;
+            if was_live {
+                // Reviewing a historical cursor also freezes its surrounding view.
+                self.start_track = Track::Frozen;
+                self.end_track = Track::Frozen;
+            }
+        }
         self.recompute();
     }
 
@@ -822,6 +856,8 @@ impl MasterTimeline {
     }
 
     pub fn go_live(&mut self) {
+        // Discard a historical/playback viewport even if it is ahead of live data.
+        self.end = self.latest;
         self.is_playing = false;
         self.selected_annotation_ids.clear();
         self.start_track = Track::Marching;
@@ -888,6 +924,159 @@ mod tests {
 
         assert_eq!(format_idle_duration(6_300_000), "1h 45m idle");
         assert_eq!(format_idle_duration(720_000), "12m idle");
+    }
+
+    #[test]
+    fn live_indicator_turns_off_after_manual_navigation() {
+        let t0 = time::Time::from_unix_millis(1_700_000_000_000);
+        let mut tl = MasterTimeline::live(t0, 30.0).unwrap();
+        assert!(tl.is_live());
+
+        tl.set_start(tl.start().offset(1_000));
+        assert!(
+            tl.is_live(),
+            "Resizing the past edge must not disable live-follow"
+        );
+        tl.go_live();
+        assert!(tl.is_live());
+
+        tl.set_end(tl.end().offset(-1_000));
+        assert!(!tl.is_live());
+        tl.go_live();
+
+        tl.set_setpoint(tl.setpoint().offset(-1_000));
+        assert!(!tl.is_live());
+        let reviewing_window = (tl.start(), tl.end());
+        tl.observe(t0.offset(500));
+        assert_eq!((tl.start(), tl.end()), reviewing_window);
+        tl.go_live();
+
+        tl.set_day_bounds_ms(None);
+        tl.pan_to_start_ms(tl.start_utc_ms() - 1_000);
+        assert!(!tl.is_live());
+        tl.go_live();
+
+        tl.zoom_around_ms(tl.setpoint_utc_ms(), 0.5);
+        assert!(
+            tl.is_live(),
+            "Zooming keeps live-follow if the latest sample fits"
+        );
+        tl.go_live();
+        assert!(tl.is_live());
+        assert_eq!(tl.setpoint(), tl.end());
+
+        // Playback can run ahead of ingestion; Live must jump back to the source.
+        tl.set_end(t0.offset(60_000));
+        tl.set_setpoint(t0.offset(60_000));
+        tl.set_playing(true);
+        let latest = t0.offset(2_000);
+        tl.observe(latest);
+        tl.go_live();
+        assert!(tl.is_live());
+        assert!(!tl.is_playing());
+        assert_eq!(tl.end(), latest);
+        assert_eq!(tl.setpoint(), latest);
+        tl.observe(latest.offset(1_000));
+        assert_eq!(tl.setpoint(), latest.offset(1_000));
+    }
+
+    #[test]
+    fn resizing_window_carries_an_excluded_playhead() {
+        let mut tl = MasterTimeline::live(time::Time::from_unix_millis(100_000), 30.0).unwrap();
+        tl.snap_to_range_ms(10_000, 50_000);
+        tl.set_setpoint(time::Time::from_unix_millis(20_000));
+        tl.set_start(time::Time::from_unix_millis(30_000));
+        assert_eq!(tl.start_utc_ms(), 30_000);
+        assert_eq!(tl.end_utc_ms(), 50_000);
+        assert_eq!(tl.setpoint_utc_ms(), 30_000);
+        tl.set_start(time::Time::from_unix_millis(35_000));
+        assert_eq!(tl.setpoint_utc_ms(), 35_000);
+        tl.set_start(time::Time::from_unix_millis(25_000));
+        assert_eq!(
+            tl.setpoint_utc_ms(),
+            35_000,
+            "An included playhead stays put"
+        );
+
+        tl.snap_to_range_ms(10_000, 50_000);
+        tl.set_setpoint(time::Time::from_unix_millis(40_000));
+        tl.set_end(time::Time::from_unix_millis(30_000));
+        assert_eq!(tl.start_utc_ms(), 10_000);
+        assert_eq!(tl.end_utc_ms(), 30_000);
+        assert_eq!(tl.setpoint_utc_ms(), 30_000);
+        tl.set_end(time::Time::from_unix_millis(25_000));
+        assert_eq!(tl.setpoint_utc_ms(), 25_000);
+        tl.set_end(time::Time::from_unix_millis(35_000));
+        assert_eq!(tl.setpoint_utc_ms(), 25_000);
+
+        tl.go_live();
+        tl.set_end(time::Time::from_unix_millis(99_000));
+        assert!(!tl.is_live());
+        assert_eq!(tl.setpoint_utc_ms(), 99_000);
+        assert!(tl.range().contains(&tl.setpoint()));
+    }
+
+    #[test]
+    fn live_follow_depends_on_playhead_and_view_compatibility() {
+        let t0 = time::Time::from_unix_millis(1_700_000_000_000);
+        let mut tl = MasterTimeline::live(t0, 30.0).unwrap();
+
+        // A fixed viewport can remain live, with the cursor inside, not at its end.
+        tl.set_start(t0.offset(-10_000));
+        tl.set_end(t0.offset(10_000));
+        assert!(tl.is_live());
+        assert_eq!(tl.setpoint(), t0);
+        tl.observe(t0.offset(1_000));
+        assert!(tl.is_live());
+        assert_eq!(tl.setpoint(), t0.offset(1_000));
+        assert_eq!(tl.end(), t0.offset(10_000));
+
+        // Panning and zooming preserve follow when the live position still fits.
+        tl.set_day_bounds_ms(None);
+        tl.pan_to_start_ms(t0.unix_millis() - 9_000);
+        assert!(tl.is_live());
+        assert_eq!(tl.setpoint(), t0.offset(1_000));
+        tl.zoom_around_ms(tl.setpoint_utc_ms(), 0.5);
+        assert!(tl.is_live());
+        tl.set_setpoint(tl.setpoint());
+        assert!(tl.is_live());
+
+        // Once incoming data leaves a fixed view, following stops automatically.
+        let end = tl.end();
+        tl.observe(end.offset(1));
+        assert!(!tl.is_live());
+        assert!(tl.range().contains(&tl.setpoint()));
+        let frozen = tl.setpoint();
+        tl.observe(end.offset(2));
+        assert_eq!(tl.setpoint(), frozen);
+
+        tl.go_live();
+        assert!(tl.is_live());
+        tl.set_day_bounds_ms(None);
+        tl.pan_to_start_ms(tl.start_utc_ms() - 60_000);
+        assert!(!tl.is_live());
+
+        // Changing a view does not silently re-enable previously paused follow.
+        tl.go_live();
+        tl.set_setpoint(tl.setpoint().offset(-1));
+        tl.set_end(tl.end().offset(1_000));
+        assert!(!tl.is_live());
+    }
+
+    #[test]
+    fn pause_freezes_live_follow_and_go_live_resumes_it() {
+        let t0 = time::Time::from_unix_millis(1_700_000_000_000);
+        let mut tl = MasterTimeline::live(t0, 30.0).unwrap();
+        tl.toggle_playing();
+        assert!(!tl.is_live());
+        assert!(!tl.is_playing());
+        tl.observe(t0.offset(1_000));
+        assert_eq!(tl.setpoint(), t0);
+        tl.go_live();
+        assert!(tl.is_live());
+        assert_eq!(tl.setpoint(), t0.offset(1_000));
+        tl.observe(t0.offset(2_000));
+        assert_eq!(tl.setpoint(), t0.offset(2_000));
     }
 
     #[test]

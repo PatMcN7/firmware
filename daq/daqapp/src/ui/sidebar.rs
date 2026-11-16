@@ -52,6 +52,9 @@ pub fn show(app: &mut app::DAQApp, ctx: &eframe::egui::Context) {
     show_top_header_bar(app, ctx);
     show_share_popover(app, ctx);
 
+    // Reserve the full-width timeline before the left rail and sidebar.
+    ui::timeline::show(app, ctx);
+
     let theme = ui::theme::get_theme(ctx);
     let border_color = theme.border_color();
     let accent_color = theme.accent_color();

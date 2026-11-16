@@ -295,6 +295,7 @@ impl DAQApp {
             selection_request: 0,
             can_bus_speed: daqcore::connection::CanBusSpeed::Kbps500,
             udp_port: 5000,
+            beamng_port: daqcore::beamng::DEFAULT_PORT,
             router,
             bus_load_samples: Vec::new(),
             hover_utc_ms: None,
@@ -733,6 +734,7 @@ impl DAQApp {
                 }
             }
             action::AppAction::FitDay => {
+                self.timeline_ui.reset_ruler();
                 if let Some((day_min, day_max)) = self.router.timeline().day_bounds_ms() {
                     self.router
                         .timeline_mut()

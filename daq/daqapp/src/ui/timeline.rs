@@ -129,6 +129,24 @@ pub enum ChunkFilter {
     Faults,
 }
 
+/// Navigation coordinates only. The MasterTimeline remains the sole data viewport.
+#[derive(Debug, Clone)]
+struct TimelineRuler {
+    projection: daqcore::timeline::GapFoldedProjection,
+    track_day_id: Option<String>,
+    fold_gaps: bool,
+    last_window: (i64, i64),
+}
+
+#[derive(Clone)]
+struct TimelinePanDrag {
+    origin: eframe::egui::Pos2,
+    origin_time_ms: i64,
+    start_ms: i64,
+    projection: daqcore::timeline::GapFoldedProjection,
+    dragging: bool,
+}
+
 /// Persistent UI state for the Master Timeline Bar, Calendar/Subchunk Navigator, and Annotation Editor modal.
 #[derive(Debug, Clone)]
 pub struct TimelineUiState {
@@ -140,6 +158,9 @@ pub struct TimelineUiState {
     pub chunk_filter: ChunkFilter,
     pub chunk_days_open_override: Option<bool>,
     pub editing_track_day: Option<(String, String)>,
+    ruler: Option<TimelineRuler>,
+    span_hint_at: Option<f64>,
+    pub(super) requested_sidebar_filter: Option<ChunkFilter>,
 }
 
 impl Default for TimelineUiState {
@@ -153,11 +174,110 @@ impl Default for TimelineUiState {
             chunk_filter: ChunkFilter::All,
             chunk_days_open_override: None,
             editing_track_day: None,
+            ruler: None,
+            span_hint_at: None,
+            requested_sidebar_filter: None,
         }
     }
 }
 
 impl TimelineUiState {
+    pub fn reset_ruler(&mut self) {
+        self.ruler = None;
+        self.span_hint_at = None;
+    }
+
+    fn span_hint_opacity(&mut self, now: f64, resizing: bool) -> Option<f32> {
+        if resizing {
+            self.span_hint_at = Some(now);
+        }
+        let elapsed = (now - self.span_hint_at?).max(0.0);
+        if elapsed >= 3.0 {
+            self.span_hint_at = None;
+            None
+        } else {
+            // Stay fully visible for two and a half seconds, then fade out.
+            Some(((3.0 - elapsed) / 0.5).min(1.0) as f32)
+        }
+    }
+
+    fn ruler_projection(
+        &mut self,
+        timeline: &daqcore::timeline::MasterTimeline,
+        day_bounds: (i64, i64),
+        active_spans: &[(i64, i64)],
+        interacting: bool,
+    ) -> daqcore::timeline::GapFoldedProjection {
+        use daqcore::timeline::{GapFoldedProjection, MIN_WINDOW_MS, Track};
+
+        let window = (timeline.start_utc_ms(), timeline.end_utc_ms());
+        let window_span = (window.1 - window.0).max(MIN_WINDOW_MS);
+        let live = timeline.is_live();
+        let track_day_id = timeline.active_track_day_id().map(str::to_owned);
+        let fold_gaps = timeline.collapse_idle_gaps();
+        let reset = self
+            .ruler
+            .as_ref()
+            .is_none_or(|ruler| ruler.track_day_id != track_day_id || ruler.fold_gaps != fold_gaps);
+        if reset {
+            let (start, end) = if live {
+                let span = window_span.saturating_mul(2).max(1_000);
+                let start = window.1.saturating_sub((span as f64 * 0.85).round() as i64);
+                (start, start.saturating_add(span))
+            } else {
+                (day_bounds.0.min(window.0), day_bounds.1.max(window.1))
+            };
+            self.ruler = Some(TimelineRuler {
+                projection: GapFoldedProjection::new(start, end, active_spans, fold_gaps && !live),
+                track_day_id,
+                fold_gaps,
+                last_window: window,
+            });
+        }
+
+        let ruler = self.ruler.as_mut().expect("ruler initialized");
+        let mut start = ruler.projection.day_start_ms();
+        let mut end = ruler.projection.day_end_ms();
+        let mut span = (end - start).max(MIN_WINDOW_MS);
+        let previous_span = (ruler.last_window.1 - ruler.last_window.0).max(MIN_WINDOW_MS);
+        // Incoming samples and playback must never trigger an automatic fit.
+        // Dragging grips also leaves the ruler fixed under the pointer.
+        let explicit_view_change = window != ruler.last_window
+            && !interacting
+            && !timeline.is_playing()
+            && timeline.start_track() == Track::Frozen
+            && timeline.end_track() == Track::Frozen;
+        if explicit_view_change && window_span != previous_span {
+            span = ((span as f64 * window_span as f64 / previous_span as f64).round() as i64)
+                .max(window_span);
+            start = window.0.saturating_sub((span - window_span) / 2);
+            end = start.saturating_add(span);
+        }
+        if live && !interacting {
+            // Translate a fixed scale with the newest sample near the right edge.
+            start = window.1.saturating_sub((span as f64 * 0.85).round() as i64);
+            end = start.saturating_add(span);
+        } else if explicit_view_change {
+            // Reveal deliberate navigation, never newly arriving offscreen data.
+            if window.0 < start {
+                start = window.0;
+                end = start.saturating_add(span);
+            } else if window.1 > end {
+                end = window.1;
+                start = end.saturating_sub(span);
+            }
+        }
+        if start != ruler.projection.day_start_ms()
+            || end != ruler.projection.day_end_ms()
+            || (live && ruler.projection.is_folded())
+        {
+            ruler.projection =
+                GapFoldedProjection::new(start, end, active_spans, fold_gaps && !live);
+        }
+        ruler.last_window = window;
+        ruler.projection.clone()
+    }
+
     pub fn open_new_at_playhead(
         &mut self,
         router: &daqcore::router::VirtualTimelineRouter,
@@ -182,6 +302,19 @@ impl TimelineUiState {
     }
 }
 
+fn format_span_ms(span_ms: i64) -> String {
+    let span_ms = span_ms.max(0);
+    let seconds = span_ms / 1_000;
+    let millis = span_ms % 1_000;
+    if seconds == 0 {
+        format!("Δt ({millis} ms)")
+    } else if millis == 0 {
+        format!("Δt ({seconds} s)")
+    } else {
+        format!("Δt ({seconds} s {millis} ms)")
+    }
+}
+
 fn format_utc_date(utc_ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(utc_ms)
         .map(|dt| dt.format("%Y-%m-%d").to_string())
@@ -198,43 +331,6 @@ fn parse_hex_color(hex: &str, fallback: eframe::egui::Color32) -> eframe::egui::
         return eframe::egui::Color32::from_rgb(r, g, b);
     }
     fallback
-}
-
-fn provenance_badge_style(
-    provenance: Option<&daqcore::router::ClockProvenance>,
-    accent_color: eframe::egui::Color32,
-) -> (String, eframe::egui::Color32, &'static str) {
-    match provenance {
-        Some(p @ daqcore::router::ClockProvenance::CanonicalPartition(mapping)) => {
-            let color = match mapping.confidence {
-                daqcore::log_parse::correlate::ClockConfidence::GpsSynced { .. } => {
-                    eframe::egui::Color32::from_rgb(34, 197, 94)
-                }
-                daqcore::log_parse::correlate::ClockConfidence::RtcEstimated
-                | daqcore::log_parse::correlate::ClockConfidence::ManualOffset => {
-                    eframe::egui::Color32::from_rgb(56, 189, 248)
-                }
-                daqcore::log_parse::correlate::ClockConfidence::FileMtimeEstimated => {
-                    eframe::egui::Color32::from_rgb(245, 158, 11)
-                }
-            };
-            (
-                format!("🕒 {}", p.badge_label()),
-                color,
-                "Canonical SD Partition clock correlation provenance at Playhead",
-            )
-        }
-        Some(p @ daqcore::router::ClockProvenance::LiveProvisional) => (
-            format!("📡 {}", p.badge_label()),
-            accent_color,
-            "Provisional Live UDP / CAN telemetry stream",
-        ),
-        None => (
-            "🕒 No Telemetry at Playhead".to_owned(),
-            eframe::egui::Color32::from_gray(130),
-            "Playhead is currently over an unlogged interval",
-        ),
-    }
 }
 
 pub fn show(app: &mut app::DAQApp, ctx: &eframe::egui::Context) {
@@ -261,6 +357,13 @@ pub fn show(app: &mut app::DAQApp, ctx: &eframe::egui::Context) {
                 &mut app.diagnostic,
             );
         });
+
+    if let Some(filter) = app.timeline_ui.requested_sidebar_filter.take() {
+        app.timeline_ui.chunk_filter = filter;
+        app.timeline_ui.chunk_search_query.clear();
+        app.is_sidebar_open = true;
+        app.sidebar_tab = ui::sidebar::SidebarTab::Sessions;
+    }
 
     show_chunk_navigator_window(
         ctx,
@@ -289,846 +392,15 @@ pub fn show_timeline_contents(
     bus_load_samples: &mut Vec<workspace_view::BusLoadSample>,
     diagnostic: &mut Option<String>,
 ) -> bool {
-    let theme = ui::theme::get_theme(ui.ctx());
-    let accent_color = theme.accent_color();
     let previous_span = router.timeline().window_secs();
+    let accent_color = ui::theme::get_theme(ui.ctx()).accent_color();
     ui.spacing_mut().item_spacing = eframe::egui::vec2(4.0, 2.0);
-
-    // -------------------------------------------------------------------------
-    // Top Strip: Day Overview, 1Hz Activity Envelope & Event Annotation Ribbon
-    // -------------------------------------------------------------------------
     show_day_overview_lane(ui, router, timeline_ui, diagnostic, accent_color);
-
-    ui.add_space(1.0);
-
-    // -------------------------------------------------------------------------
-    // Middle Strip: Active Window Scrub & Playhead Ruler
-    // -------------------------------------------------------------------------
-    show_active_window_scrub_lane(ui, router, timeline_ui, accent_color);
-
     ui.add_space(2.0);
-
-    // -------------------------------------------------------------------------
-    // Bottom Strip: Unified Transport, Time Readout, Stints/Faults & Provenance
-    // -------------------------------------------------------------------------
-    let track_days = router.list_track_days().unwrap_or_default();
-    let active_day_id = router.timeline().active_track_day_id().map(str::to_owned);
-    let mut requested_day_change: Option<Option<String>> = None;
-    let mut clear_live_clicked = false;
-    let mut open_new_bookmark = false;
-    let mut open_new_interval = false;
-
-    // Pre-query active day annotations so the transport footer can display `Stints (N)` and `Faults (N)` menus
-    let captured_for_menu = router.captured_time_span();
-    let (menu_day_min, menu_day_max) = router
-        .timeline()
-        .day_bounds_ms()
-        .or_else(|| captured_for_menu.map(|(s, e)| (s.unix_millis(), e.unix_millis())))
-        .unwrap_or_else(|| {
-            (
-                router.timeline().start_utc_ms(),
-                router.timeline().end_utc_ms(),
-            )
-        });
-    let menu_day_min = menu_day_min.min(router.timeline().start_utc_ms());
-    let menu_day_max = menu_day_max
-        .max(router.timeline().end_utc_ms())
-        .max(menu_day_min + 1_000);
-    let all_day_annotations: Vec<daqcore::storage::Annotation> = router
-        .query_annotations_in_range(menu_day_min..=menu_day_max)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|a| {
-            active_day_id
-                .as_deref()
-                .is_none_or(|day_id| a.track_day_id == day_id)
-        })
-        .collect();
-    let mut stint_annotations: Vec<daqcore::storage::Annotation> = all_day_annotations
-        .iter()
-        .filter(|a| a.category != "fault")
-        .cloned()
-        .collect();
-    stint_annotations.sort_by_key(|a| (a.start_utc_ms, a.end_utc_ms.unwrap_or(a.start_utc_ms)));
-    let mut fault_annotations: Vec<daqcore::storage::Annotation> = all_day_annotations
-        .iter()
-        .filter(|a| a.category == "fault")
-        .cloned()
-        .collect();
-    fault_annotations.sort_by_key(|a| (a.start_utc_ms, a.end_utc_ms.unwrap_or(a.start_utc_ms)));
-
-    let mut menu_single_click: Option<(String, i64, Option<i64>)> = None;
-    let mut menu_shift_click: Option<(String, i64, Option<i64>)> = None;
-    let mut menu_edit_ann: Option<daqcore::storage::Annotation> = None;
-    let mut menu_delete_id: Option<String> = None;
-    let mut menu_jump_fault_ms: Option<i64> = None;
-    let selected_ann_ids_for_menu: Vec<String> =
-        router.timeline().selected_annotation_ids().to_vec();
-
-    // Provenance & LOD metadata for compact badge
-    let setpoint_ms = router.timeline().setpoint_utc_ms();
-    let provenance = router.clock_provenance_at(setpoint_ms);
-    let (prov_text, prov_color, prov_hover) =
-        provenance_badge_style(provenance.as_ref(), accent_color);
-    let active_res = match router
-        .timeline()
-        .resolution_for_width(ui.available_width().max(1.0))
-    {
-        daqcore::router::Resolution::Overview1Hz => "1Hz",
-        daqcore::router::Resolution::Overview10Hz => "10Hz",
-        daqcore::router::Resolution::FullRes => "Full-Res",
-    };
-    let tile_cache_mib = router.tile_cache().lru_bytes() as f64 / (1024.0 * 1024.0);
-    let partition_count = router.partitions().len();
-    let live_frame_count = router.live_buffer().len();
-    let viewport_start_lbl = router.timeline().start().label();
-    let viewport_end_lbl = router.timeline().end().label();
-    let playhead_lbl = router.timeline().setpoint().label();
-    let active_date_lbl = active_day_id
-        .clone()
-        .unwrap_or_else(|| format_utc_date(setpoint_ms));
-
-    let selected_ids: Vec<String> = router.timeline().selected_annotation_ids().to_vec();
-    let is_comparing = router.timeline().is_comparison_mode();
-    let mut clear_comparison = false;
-
-    let theme = ui::theme::get_theme(ui.ctx());
-    let border_color = theme.border_color();
-    let bg_color = ui.visuals().extreme_bg_color;
-    let stint_color = eframe::egui::Color32::from_rgb(34, 197, 94);
-    let fault_color = eframe::egui::Color32::from_rgb(245, 158, 11);
-    let event_color = eframe::egui::Color32::from_rgb(168, 85, 247);
-
-    ui.horizontal_wrapped(|ui| {
-        ui.style_mut().wrap_mode = Some(eframe::egui::TextWrapMode::Extend);
-        ui.spacing_mut().item_spacing = eframe::egui::vec2(3.0, 2.0);
-
-        // =====================================================================
-        // GROUP 1: Playhead Readout & Clock Provenance (Far Left)
-        // =====================================================================
-        let ts_pill = eframe::egui::Button::new(
-            eframe::egui::RichText::new(format!("{active_date_lbl}  {playhead_lbl} UTC"))
-                .monospace()
-                .size(11.0)
-                .strong()
-                .color(ui.visuals().strong_text_color()),
-        )
-        .wrap_mode(eframe::egui::TextWrapMode::Extend)
-        .fill(bg_color)
-        .stroke(eframe::egui::Stroke::new(1.0_f32, border_color))
-        .corner_radius(3.0)
-        .sense(eframe::egui::Sense::hover());
-        ui.add(ts_pill).on_hover_text(format!(
-            "Playhead: {playhead_lbl}\nViewport: {viewport_start_lbl} .. {viewport_end_lbl} ({:.2}s)",
-            router.timeline().window_secs()
-        ));
-
-        let prov_pill = eframe::egui::Button::new(
-            eframe::egui::RichText::new(format!("{prov_text} · {active_res}"))
-                .color(prov_color)
-                .small(),
-        )
-        .wrap_mode(eframe::egui::TextWrapMode::Extend)
-        .fill(prov_color.gamma_multiply(0.14))
-        .stroke(eframe::egui::Stroke::new(
-            1.0_f32,
-            prov_color.gamma_multiply(0.55),
-        ))
-        .corner_radius(3.0)
-        .sense(eframe::egui::Sense::hover());
-        ui.add(prov_pill).on_hover_text(format!(
-            "{prov_hover}\nLOD Tier: {active_res}\nTile Cache: {tile_cache_mib:.1} MiB\nSD Partitions: {partition_count} · Live Frames: {live_frame_count}"
-        ));
-
-        ui.add_space(4.0);
-        ui.separator();
-        ui.add_space(2.0);
-
-        // =====================================================================
-        // GROUP 2: Playback Transport Deck (Center-Left, Accent-Highlighted Play)
-        // =====================================================================
-        let timeline = router.timeline_mut();
-        if ui
-            .small_button("⏮")
-            .on_hover_text("Step playhead backward 100 ms (or H / Left for 1% window step)")
-            .clicked()
-        {
-            timeline.step_by_ms(-100);
-        }
-        if ui
-            .small_button("⏪")
-            .on_hover_text("Step playhead backward 10 ms (Alt+H / Alt+Left)")
-            .clicked()
-        {
-            timeline.step_by_ms(-10);
-        }
-
-        let is_playing = timeline.is_playing();
-        let play_color = if is_playing {
-            fault_color
-        } else {
-            accent_color
-        };
-        let play_btn = eframe::egui::Button::new(
-            eframe::egui::RichText::new(if is_playing { "⏸ Pause" } else { "▶ Play" })
-                .size(11.0)
-                .strong()
-                .color(if theme.is_light && !is_playing {
-                    accent_color
-                } else {
-                    ui.visuals().strong_text_color()
-                }),
-        )
-        .wrap_mode(eframe::egui::TextWrapMode::Extend)
-        .fill(play_color.gamma_multiply(0.24))
-        .stroke(eframe::egui::Stroke::new(1.0_f32, play_color))
-        .corner_radius(3.0);
-        if ui
-            .add(play_btn)
-            .on_hover_text("Play / pause playhead scrub (Space)")
-            .clicked()
-        {
-            timeline.toggle_playing();
-        }
-
-        if ui
-            .small_button("⏩")
-            .on_hover_text("Step playhead forward 10 ms (Alt+L / Alt+Right)")
-            .clicked()
-        {
-            timeline.step_by_ms(10);
-        }
-        if ui
-            .small_button("⏭")
-            .on_hover_text("Step playhead forward 100 ms (or L / Right for 1% window step)")
-            .clicked()
-        {
-            timeline.step_by_ms(100);
-        }
-
-        let current_speed = timeline.playback_speed();
-        eframe::egui::ComboBox::from_id_salt("timeline_playback_speed")
-            .width(46.0)
-            .selected_text(format!("{current_speed}x"))
-            .show_ui(ui, |ui| {
-                for &preset in &daqcore::timeline::PLAYBACK_SPEED_PRESETS {
-                    if ui
-                        .selectable_label(
-                            (current_speed - preset).abs() < 1e-4,
-                            format!("{preset}x"),
-                        )
-                        .clicked()
-                    {
-                        timeline.set_playback_speed(preset);
-                    }
-                }
-            });
-
-        // LIVE Follow toggle
-        let is_live = timeline.is_live();
-        let live_btn = eframe::egui::Button::new(
-            eframe::egui::RichText::new(if is_live { "🔴 LIVE" } else { "• LIVE" })
-                .size(10.5)
-                .strong()
-                .color(if is_live {
-                    eframe::egui::Color32::WHITE
-                } else {
-                    theme.muted_text_color()
-                }),
-        )
-        .wrap_mode(eframe::egui::TextWrapMode::Extend)
-        .fill(if is_live {
-            eframe::egui::Color32::from_rgb(220, 38, 38)
-        } else {
-            bg_color
-        })
-        .stroke(eframe::egui::Stroke::new(
-            1.0_f32,
-            if is_live {
-                eframe::egui::Color32::from_rgb(248, 113, 113)
-            } else {
-                border_color
-            },
-        ))
-        .corner_radius(3.0);
-        if ui
-            .add(live_btn)
-            .on_hover_text("Follow incoming live telemetry (click to toggle)")
-            .clicked()
-        {
-            if is_live {
-                timeline.set_start(timeline.start());
-                timeline.set_end(timeline.end());
-                timeline.set_setpoint(timeline.setpoint());
-            } else {
-                timeline.go_live();
-            }
-        }
-        if live_frame_count > 0
-            && ui
-                .small_button("Clear Live")
-                .on_hover_text("Clear in-memory live ring buffer")
-                .clicked()
-        {
-            clear_live_clicked = true;
-        }
-
-        ui.add_space(4.0);
-        ui.separator();
-        ui.add_space(2.0);
-
-        // =====================================================================
-        // GROUP 3: Stints, Faults & Event Markers (Color-Coded by Semantics)
-        // =====================================================================
-        // 3a. Stint Prev / Menu / Next cluster (Emerald green tint matching stint blocks)
-        let cur_start = router.timeline().start_utc_ms();
-        if !stint_annotations.is_empty()
-            && ui
-                .add(
-                    eframe::egui::Button::new(
-                        eframe::egui::RichText::new("◀")
-                            .size(10.0)
-                            .color(stint_color),
-                    )
-                    .small()
-                    .fill(stint_color.gamma_multiply(0.12))
-                    .stroke(eframe::egui::Stroke::new(
-                        1.0_f32,
-                        stint_color.gamma_multiply(0.45),
-                    )),
-                )
-                .on_hover_text("Jump to previous Driving Stint / Event")
-                .clicked()
-        {
-            let prev = stint_annotations
-                .iter()
-                .rev()
-                .find(|a| a.start_utc_ms < cur_start - 500)
-                .or_else(|| stint_annotations.last());
-            if let Some(ann) = prev {
-                menu_single_click = Some((ann.id.clone(), ann.start_utc_ms, ann.end_utc_ms));
-            }
-        }
-
-        ui.scope(|ui| {
-            if !stint_annotations.is_empty() {
-                ui.visuals_mut().widgets.inactive.bg_fill = stint_color.gamma_multiply(0.14);
-                ui.visuals_mut().widgets.inactive.bg_stroke =
-                    eframe::egui::Stroke::new(1.0_f32, stint_color.gamma_multiply(0.5));
-            }
-            ui.menu_button(
-                eframe::egui::RichText::new(format!("🏷 Stints ({})", stint_annotations.len()))
-                    .size(11.0)
-                    .color(if stint_annotations.is_empty() {
-                        ui.visuals().text_color()
-                    } else {
-                        stint_color
-                    }),
-                |ui| {
-                    ui.set_min_width(310.0);
-                    ui.horizontal(|ui| {
-                        ui.checkbox(
-                            &mut timeline_ui.show_stints,
-                            "Show Stints & Events on timeline",
-                        );
-                        if ui
-                            .small_button("📅 Browse All Chunks…")
-                            .on_hover_text("Open floating Calendar & Subchunk Navigator")
-                            .clicked()
-                        {
-                            timeline_ui.show_chunk_navigator = !timeline_ui.show_chunk_navigator;
-                            ui.close();
-                        }
-                    });
-                    if !track_days.is_empty() {
-                        ui.horizontal(|ui| {
-                            ui.label(eframe::egui::RichText::new("Track Day:").small().weak());
-                            let selected_text = active_day_id.as_deref().unwrap_or("All Days");
-                            eframe::egui::ComboBox::from_id_salt("timeline_track_day_selector")
-                                .width(140.0)
-                                .selected_text(selected_text)
-                                .show_ui(ui, |ui| {
-                                    if ui
-                                        .selectable_label(active_day_id.is_none(), "All Track Days")
-                                        .clicked()
-                                    {
-                                        requested_day_change = Some(None);
-                                    }
-                                    for td in &track_days {
-                                        let label = if td.location.is_empty() {
-                                            td.id.clone()
-                                        } else {
-                                            format!("{} ({})", td.id, td.location)
-                                        };
-                                        if ui
-                                            .selectable_label(
-                                                active_day_id.as_deref() == Some(td.id.as_str()),
-                                                label,
-                                            )
-                                            .clicked()
-                                        {
-                                            requested_day_change = Some(Some(td.id.clone()));
-                                        }
-                                    }
-                                });
-                        });
-                    }
-                    ui.separator();
-                    if stint_annotations.is_empty() {
-                        ui.label(
-                            eframe::egui::RichText::new("No stints or events in this track day.")
-                                .italics()
-                                .weak(),
-                        );
-                    } else {
-                        eframe::egui::ScrollArea::vertical()
-                            .max_height(260.0)
-                            .show(ui, |ui| {
-                                for ann in &stint_annotations {
-                                    let is_sel = selected_ann_ids_for_menu.contains(&ann.id);
-                                    let dur_s = ann
-                                        .end_utc_ms
-                                        .map(|e| (e - ann.start_utc_ms).max(0) as f64 / 1000.0);
-                                    let time_lbl =
-                                        daqcore::time::Time::from_unix_millis(ann.start_utc_ms)
-                                            .label();
-                                    let row_lbl = match dur_s {
-                                        Some(d) if d > 0.0 => {
-                                            format!("{}  ({time_lbl}, {d:.1}s)", ann.name)
-                                        }
-                                        _ => format!("📍 {}  ({time_lbl})", ann.name),
-                                    };
-                                    ui.horizontal(|ui| {
-                                        if ui
-                                            .selectable_label(is_sel, row_lbl)
-                                            .on_hover_text(
-                                                "Click to snap viewport to this stint/event",
-                                            )
-                                            .clicked()
-                                        {
-                                            menu_single_click = Some((
-                                                ann.id.clone(),
-                                                ann.start_utc_ms,
-                                                ann.end_utc_ms,
-                                            ));
-                                            ui.close();
-                                        }
-                                        if ui
-                                            .small_button(if is_sel { "-Cmp" } else { "+Cmp" })
-                                            .on_hover_text(
-                                                "Toggle multi-stint Comparison / Overlay Mode",
-                                            )
-                                            .clicked()
-                                        {
-                                            menu_shift_click = Some((
-                                                ann.id.clone(),
-                                                ann.start_utc_ms,
-                                                ann.end_utc_ms,
-                                            ));
-                                        }
-                                        if ui
-                                            .small_button("Edit")
-                                            .on_hover_text("Edit event")
-                                            .clicked()
-                                        {
-                                            menu_edit_ann = Some(ann.clone());
-                                            ui.close();
-                                        }
-                                        if ui
-                                            .small_button("×")
-                                            .on_hover_text("Delete event")
-                                            .clicked()
-                                        {
-                                            menu_delete_id = Some(ann.id.clone());
-                                        }
-                                    });
-                                }
-                            });
-                    }
-                },
-            );
-        });
-
-        if !stint_annotations.is_empty()
-            && ui
-                .add(
-                    eframe::egui::Button::new(
-                        eframe::egui::RichText::new("▶")
-                            .size(10.0)
-                            .color(stint_color),
-                    )
-                    .small()
-                    .fill(stint_color.gamma_multiply(0.12))
-                    .stroke(eframe::egui::Stroke::new(
-                        1.0_f32,
-                        stint_color.gamma_multiply(0.45),
-                    )),
-                )
-                .on_hover_text("Jump to next Driving Stint / Event")
-                .clicked()
-        {
-            let next = stint_annotations
-                .iter()
-                .find(|a| a.start_utc_ms > cur_start + 500)
-                .or_else(|| stint_annotations.first());
-            if let Some(ann) = next {
-                menu_single_click = Some((ann.id.clone(), ann.start_utc_ms, ann.end_utc_ms));
-            }
-        }
-
-        ui.add_space(2.0);
-
-        // 3b. Faults Menu Pill (Amber tint when faults > 0 so faults stand out)
-        ui.scope(|ui| {
-            if !fault_annotations.is_empty() {
-                ui.visuals_mut().widgets.inactive.bg_fill = fault_color.gamma_multiply(0.14);
-                ui.visuals_mut().widgets.inactive.bg_stroke =
-                    eframe::egui::Stroke::new(1.0_f32, fault_color.gamma_multiply(0.55));
-            }
-            ui.menu_button(
-                eframe::egui::RichText::new(format!("⚠ Faults ({})", fault_annotations.len()))
-                    .size(11.0)
-                    .color(if fault_annotations.is_empty() {
-                        theme.muted_text_color()
-                    } else {
-                        fault_color
-                    }),
-                |ui| {
-                    ui.set_min_width(340.0);
-                    ui.checkbox(
-                        &mut timeline_ui.show_faults,
-                        "Show fault tick markers on timeline",
-                    );
-                    ui.separator();
-                    if fault_annotations.is_empty() {
-                        ui.label(
-                            eframe::egui::RichText::new("No faults detected in this track day.")
-                                .italics()
-                                .weak(),
-                        );
-                    } else {
-                        let mut grouped: Vec<(String, Vec<&daqcore::storage::Annotation>)> =
-                            Vec::new();
-                        for f in &fault_annotations {
-                            let short = f
-                                .name
-                                .strip_prefix("Fault: ")
-                                .unwrap_or(&f.name)
-                                .to_owned();
-                            if let Some((_, list)) = grouped.iter_mut().find(|(k, _)| k == &short)
-                            {
-                                list.push(f);
-                            } else {
-                                grouped.push((short, vec![f]));
-                            }
-                        }
-                        ui.label(
-                            eframe::egui::RichText::new(format!(
-                                "{} fault types ({} total transitions) — click to jump:",
-                                grouped.len(),
-                                fault_annotations.len()
-                            ))
-                            .weak()
-                            .small(),
-                        );
-                        eframe::egui::ScrollArea::vertical()
-                            .max_height(300.0)
-                            .show(ui, |ui| {
-                                for (fault_name, occurrences) in grouped {
-                                    let first_ms = occurrences[0].start_utc_ms;
-                                    let first_lbl =
-                                        daqcore::time::Time::from_unix_millis(first_ms).label();
-                                    let header = format!(
-                                        "⚠ {}  [{}×, first @ {}]",
-                                        fault_name,
-                                        occurrences.len(),
-                                        first_lbl
-                                    );
-                                    ui.collapsing(header, |ui| {
-                                        for (idx, occ) in occurrences.iter().take(50).enumerate() {
-                                            let t_lbl = daqcore::time::Time::from_unix_millis(
-                                                occ.start_utc_ms,
-                                            )
-                                            .label();
-                                            let dur_str = occ
-                                                .end_utc_ms
-                                                .filter(|&e| e > occ.start_utc_ms)
-                                                .map(|e| {
-                                                    format!(
-                                                        " ({:.2}s)",
-                                                        (e - occ.start_utc_ms) as f64 / 1000.0
-                                                    )
-                                                })
-                                                .unwrap_or_default();
-                                            if ui
-                                                .small_button(format!(
-                                                    "#{} @ {}{}",
-                                                    idx + 1,
-                                                    t_lbl,
-                                                    dur_str
-                                                ))
-                                                .on_hover_text(
-                                                    "Jump playhead and 10s window to this fault",
-                                                )
-                                                .clicked()
-                                            {
-                                                menu_jump_fault_ms = Some(occ.start_utc_ms);
-                                                ui.close();
-                                            }
-                                        }
-                                        if occurrences.len() > 50 {
-                                            ui.label(
-                                                eframe::egui::RichText::new(format!(
-                                                    "…and {} more occurrences",
-                                                    occurrences.len() - 50
-                                                ))
-                                                .weak()
-                                                .small(),
-                                            );
-                                        }
-                                    });
-                                }
-                            });
-                    }
-                },
-            );
-        });
-
-        // 3c. Quick Bookmark / Event creation buttons (Violet/Indigo accent)
-        let mark_btn = eframe::egui::Button::new(
-            eframe::egui::RichText::new("📍 +Mark")
-                .size(10.5)
-                .color(event_color),
-        )
-        .wrap_mode(eframe::egui::TextWrapMode::Extend)
-        .fill(event_color.gamma_multiply(0.10))
-        .stroke(eframe::egui::Stroke::new(
-            1.0_f32,
-            event_color.gamma_multiply(0.45),
-        ))
-        .corner_radius(3.0);
-        if ui
-            .add(mark_btn)
-            .on_hover_text("Drop a point event bookmark at the current Playhead (Hotkey: M)")
-            .clicked()
-        {
-            open_new_bookmark = true;
-        }
-
-        let event_btn = eframe::egui::Button::new(
-            eframe::egui::RichText::new("🏷 +Event")
-                .size(10.5)
-                .color(event_color),
-        )
-        .wrap_mode(eframe::egui::TextWrapMode::Extend)
-        .fill(event_color.gamma_multiply(0.10))
-        .stroke(eframe::egui::Stroke::new(
-            1.0_f32,
-            event_color.gamma_multiply(0.45),
-        ))
-        .corner_radius(3.0);
-        if ui
-            .add(event_btn)
-            .on_hover_text("Create a named interval annotation spanning [start .. end]")
-            .clicked()
-        {
-            open_new_interval = true;
-        }
-
-        if is_comparing {
-            let names: Vec<String> = router
-                .query_annotations_in_range(i64::MIN / 2..=i64::MAX / 2)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|a| selected_ids.contains(&a.id))
-                .map(|a| a.name)
-                .collect();
-            let compare_label = if names.is_empty() {
-                format!("Comparing {} Events  ×", selected_ids.len())
-            } else {
-                format!("Comparing: {}  ×", names.join(" vs "))
-            };
-            let cmp_pill = eframe::egui::Button::new(
-                eframe::egui::RichText::new(compare_label)
-                    .color(event_color)
-                    .small()
-                    .strong(),
-            )
-            .wrap_mode(eframe::egui::TextWrapMode::Extend)
-            .fill(event_color.gamma_multiply(0.20))
-            .stroke(eframe::egui::Stroke::new(1.0_f32, event_color))
-            .corner_radius(4.0);
-            if ui
-                .add(cmp_pill)
-                .on_hover_text("Click to exit Comparison Mode")
-                .clicked()
-            {
-                clear_comparison = true;
-            }
-        }
-
-        ui.add_space(4.0);
-        ui.separator();
-        ui.add_space(2.0);
-
-        // =====================================================================
-        // GROUP 4: Viewport Window, Zoom & Gap Folding
-        // =====================================================================
-        let timeline = router.timeline_mut();
-        let mut span = timeline.window_secs();
-        ui.label(
-            eframe::egui::RichText::new("Win:")
-                .small()
-                .color(theme.muted_text_color()),
-        );
-        let span_control = eframe::egui::DragValue::new(&mut span)
-            .range(0.1..=86_400.0)
-            .speed(0.5)
-            .suffix(" s");
-        if ui.add(span_control).changed() {
-            let center_ms = timeline.setpoint_utc_ms();
-            let half_ms = ((span * 500.0).round() as i64).max(50);
-            timeline.set_start(daqcore::time::Time::from_unix_millis(center_ms - half_ms));
-            timeline.set_end(daqcore::time::Time::from_unix_millis(center_ms + half_ms));
-            if let Err(error) = timeline.set_window_secs(span) {
-                *diagnostic = Some(error);
-            }
-        }
-        if ui
-            .small_button("−")
-            .on_hover_text("Zoom out around playhead (- / J / Down / Shift+J)")
-            .clicked()
-        {
-            timeline.zoom_around_ms(timeline.setpoint_utc_ms(), 2.0);
-        }
-        if ui
-            .small_button("+")
-            .on_hover_text("Zoom in around playhead (+ / K / Up / Shift+K)")
-            .clicked()
-        {
-            timeline.zoom_around_ms(timeline.setpoint_utc_ms(), 0.5);
-        }
-        if let Some((day_min, day_max)) = timeline.day_bounds_ms()
-            && ui
-                .small_button("↔ Fit Day")
-                .on_hover_text("Zoom out to the full Track Day overview (F)")
-                .clicked()
-        {
-            timeline.snap_to_range_ms(day_min, day_max);
-        }
-
-        let mut fold_gaps = timeline.collapse_idle_gaps();
-        let fold_btn = eframe::egui::Button::new(
-            eframe::egui::RichText::new("Fold Gaps")
-                .size(10.5)
-                .color(if fold_gaps {
-                    accent_color
-                } else {
-                    theme.muted_text_color()
-                }),
-        )
-        .wrap_mode(eframe::egui::TextWrapMode::Extend)
-        .fill(if fold_gaps {
-            accent_color.gamma_multiply(0.18)
-        } else {
-            bg_color
-        })
-        .stroke(eframe::egui::Stroke::new(
-            1.0_f32,
-            if fold_gaps {
-                accent_color.gamma_multiply(0.65)
-            } else {
-                border_color
-            },
-        ))
-        .corner_radius(3.0);
-        if ui
-            .add(fold_btn)
-            .on_hover_text(
-                "Collapse unlogged intervals (>= 60s) into thin dividers so active stints fill the horizontal ribbon (G)",
-            )
-            .clicked()
-        {
-            fold_gaps = !fold_gaps;
-            timeline.set_collapse_idle_gaps(fold_gaps);
-        }
-
-        let help_pill = eframe::egui::Button::new(
-            eframe::egui::RichText::new("?")
-                .monospace()
-                .size(10.5)
-                .color(theme.muted_text_color()),
-        )
-        .wrap_mode(eframe::egui::TextWrapMode::Extend)
-        .fill(bg_color)
-        .stroke(eframe::egui::Stroke::new(1.0_f32, border_color))
-        .corner_radius(3.0)
-        .sense(eframe::egui::Sense::hover());
-        ui.add(help_pill).on_hover_text(
-            "Keyboard Shortcuts:\n\
-             • / : Focus sidebar channel / session search (Esc to unfocus)\n\
-             • Space : Play / Pause timeline scrub\n\
-             • H / L or Left / Right : Move playhead (setpoint) left / right (1% window)\n\
-             • Alt + H / L or Alt + Left / Right : Fine-step playhead (±10 ms)\n\
-             • Shift + H / L or Shift + Left / Right : Pan viewport window left / right (10% window)\n\
-             • K / J, Up / Down, Shift + K / J, or + / - : Zoom window in / out around cursor/playhead\n\
-             • [ / ] : Jump to previous / next Driving Stint\n\
-             • F : Fit entire Track Day\n\
-             • G : Toggle Fold Idle Gaps\n\
-             • M : Drop event bookmark at Playhead\n\
-             • Ctrl/Cmd + P : Command Palette · Ctrl/Cmd + S : Toggle Sidebar",
-        );
-    });
-
-    if let Some((id, s, e)) = menu_single_click {
-        router.timeline_mut().select_single_annotation(id, s, e);
-    }
-    if let Some((id, s, e)) = menu_shift_click {
-        router.timeline_mut().toggle_comparison_annotation(id, s, e);
-    }
-    if let Some(ann) = menu_edit_ann {
-        timeline_ui.open_edit(&ann);
-    }
-    if let Some(del_id) = menu_delete_id {
-        let now_ms = daqcore::time::Time::now().unix_millis();
-        if let Err(err) = router.soft_delete_annotation(&del_id, now_ms) {
-            *diagnostic = Some(format!("Failed to delete annotation: {err}"));
-        }
-    }
-    if let Some(fault_ms) = menu_jump_fault_ms {
-        let tl = router.timeline_mut();
-        let half_win = (tl.window_ms() / 2).clamp(2_500, 10_000);
-        tl.snap_to_range_ms(
-            fault_ms.saturating_sub(half_win),
-            fault_ms.saturating_add(half_win),
-        );
-        tl.set_setpoint(daqcore::time::Time::from_unix_millis(fault_ms));
-    }
-
-    if let Some(day_choice) = requested_day_change
-        && let Err(err) = router.select_track_day(day_choice)
-    {
-        *diagnostic = Some(format!("Failed to switch track day: {err}"));
-    }
-    if clear_live_clicked {
-        router.reset_live(daqcore::time::Time::now());
-        bus_load_samples.clear();
-    }
-    if open_new_bookmark {
-        timeline_ui.open_new_at_playhead(router, true);
-    }
-    if open_new_interval {
-        timeline_ui.open_new_at_playhead(router, false);
-    }
-
-    if clear_comparison {
-        router.timeline_mut().clear_selected_annotations();
-    }
-
+    ui::timeline_controls::show(ui, router, timeline_ui, bus_load_samples, diagnostic);
     if let Some(error) = diagnostic {
         ui.colored_label(ui.visuals().error_fg_color, error);
     }
-
     previous_span != router.timeline().window_secs()
 }
 
@@ -1175,13 +447,14 @@ fn show_day_overview_lane(
         active_spans_for_folding.push((ls, le));
     }
 
-    let collapse_idle_gaps = router.timeline().collapse_idle_gaps();
-    let projection = daqcore::timeline::GapFoldedProjection::new(
-        day_min_ms,
-        day_max_ms,
+    let projection = timeline_ui.ruler_projection(
+        router.timeline(),
+        (day_min_ms, day_max_ms),
         &active_spans_for_folding,
-        collapse_idle_gaps,
+        ui.input(|input| input.pointer.any_down()),
     );
+    let day_min_ms = projection.day_start_ms();
+    let day_max_ms = projection.day_end_ms();
 
     let activity_1hz = router.activity_envelope_1hz(day_min_ms..=day_max_ms);
     let annotations: Vec<daqcore::storage::Annotation> = router
@@ -1198,9 +471,14 @@ fn show_day_overview_lane(
 
     let lane_height = 28.0;
     let width = ui.available_width().max(16.0);
-    let (rect, lane_response) = ui.allocate_exact_size(
-        eframe::egui::vec2(width, lane_height),
+    // Keep the playhead above the lane and the window drag rail below it.
+    let (outer_rect, lane_response) = ui.allocate_exact_size(
+        eframe::egui::vec2(width, lane_height + 15.0),
         eframe::egui::Sense::click_and_drag(),
+    );
+    let rect = eframe::egui::Rect::from_min_max(
+        outer_rect.left_top() + eframe::egui::vec2(0.0, 8.0),
+        outer_rect.right_bottom() - eframe::egui::vec2(0.0, 7.0),
     );
     let clip_rect = rect.intersect(ui.clip_rect());
     let painter = ui.painter_at(clip_rect);
@@ -1216,10 +494,71 @@ fn show_day_overview_lane(
         projection.fraction_to_time(frac)
     };
 
+    // Secondary-button panning works over the whole lane, including its grips.
+    // Keep the initial projection so live-follow cannot move the drag coordinates.
+    let pan_id = ui.id().with("day_secondary_pan");
+    let (secondary_pressed, secondary_down, secondary_released, pointer) = ui.input(|input| {
+        (
+            input
+                .pointer
+                .button_pressed(eframe::egui::PointerButton::Secondary),
+            input
+                .pointer
+                .button_down(eframe::egui::PointerButton::Secondary),
+            input
+                .pointer
+                .button_released(eframe::egui::PointerButton::Secondary),
+            input.pointer.interact_pos(),
+        )
+    });
+    if secondary_pressed
+        && lane_response.contains_pointer()
+        && let Some(pointer) = pointer
+    {
+        ui.data_mut(|data| {
+            data.insert_temp(
+                pan_id,
+                TimelinePanDrag {
+                    origin: pointer,
+                    origin_time_ms: x_to_time(pointer.x),
+                    start_ms: router.timeline().start_utc_ms(),
+                    projection: projection.clone(),
+                    dragging: false,
+                },
+            )
+        });
+    }
+    let mut right_panning = false;
+    if let Some(mut drag) = ui.data(|data| data.get_temp::<TimelinePanDrag>(pan_id)) {
+        if (secondary_down || secondary_released)
+            && let Some(pointer) = pointer
+        {
+            drag.dragging |= pointer.distance(drag.origin) >= 4.0;
+            if drag.dragging {
+                right_panning = true;
+                let fraction = ((pointer.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+                let delta_ms = drag.projection.fraction_to_time(fraction) - drag.origin_time_ms;
+                let timeline = router.timeline_mut();
+                timeline.set_playing(false);
+                timeline.pan_to_start_ms(drag.start_ms.saturating_add(delta_ms));
+            }
+        }
+        ui.data_mut(|data| {
+            if secondary_down {
+                data.insert_temp(pan_id, drag);
+            } else {
+                data.remove::<TimelinePanDrag>(pan_id);
+            }
+        });
+    }
+
     // 2. Shade Canonical SD Partitions (solid accent tint)
     let canonical_fill = eframe::egui::Color32::from_rgba_unmultiplied(14, 165, 233, 48);
     let canonical_border = eframe::egui::Color32::from_rgba_unmultiplied(56, 189, 248, 120);
     for (p_start, p_end, _) in &canonical_spans {
+        if *p_end < day_min_ms || *p_start > day_max_ms {
+            continue;
+        }
         let x0 = time_to_x(*p_start).max(rect.left());
         let x1 = time_to_x(*p_end).min(rect.right()).max(x0 + 2.0);
         let part_rect = eframe::egui::Rect::from_min_max(
@@ -1239,7 +578,7 @@ fn show_day_overview_lane(
     if let Some((live_start, live_end)) = live_bounds {
         let max_canon = canonical_spans.iter().map(|(_, e, _)| *e).max();
         let eff_start = max_canon.map_or(live_start, |mc| live_start.max(mc));
-        if eff_start <= live_end {
+        if eff_start <= live_end && live_end >= day_min_ms && eff_start <= day_max_ms {
             let x0 = time_to_x(eff_start).max(rect.left());
             let x1 = time_to_x(live_end).min(rect.right()).max(x0 + 3.0);
             let live_rect = eframe::egui::Rect::from_min_max(
@@ -1378,7 +717,7 @@ fn show_day_overview_lane(
 
     // 6. Render Stints/Events (top band, true time width — never inflated or falsely merged)
     //    and Fault Onset Ticks (bottom 8px strip — crisp 2px ticks that never pile into a giant bar)
-    let mut interacted_with_overlay = false;
+    let mut interacted_with_overlay = right_panning;
     let mut pending_single_click: Option<(String, i64, Option<i64>)> = None;
     let mut pending_shift_click: Option<(String, i64, Option<i64>)> = None;
     let mut pending_edit: Option<daqcore::storage::Annotation> = None;
@@ -1583,7 +922,7 @@ fn show_day_overview_lane(
             eframe::egui::Sense::drag(),
         )
         .on_hover_cursor(eframe::egui::CursorIcon::ResizeHorizontal)
-        .on_hover_text("Drag to adjust window start time");
+        .on_hover_text("Resize window start");
     let right_grip_resp = ui
         .interact(
             right_grip_hit,
@@ -1591,9 +930,9 @@ fn show_day_overview_lane(
             eframe::egui::Sense::drag(),
         )
         .on_hover_cursor(eframe::egui::CursorIcon::ResizeHorizontal)
-        .on_hover_text("Drag to adjust window end time");
+        .on_hover_text("Resize window end");
 
-    if left_grip_resp.dragged()
+    if left_grip_resp.dragged_by(eframe::egui::PointerButton::Primary)
         && let Some(pointer) = left_grip_resp.interact_pointer_pos()
     {
         interacted_with_overlay = true;
@@ -1602,7 +941,7 @@ fn show_day_overview_lane(
             x_to_time(pointer.x).min(tl.end_utc_ms() - daqcore::timeline::MIN_WINDOW_MS);
         tl.set_start(daqcore::time::Time::from_unix_millis(new_start));
         let _ = tl.set_window_secs(tl.end().secs(tl.start()));
-    } else if right_grip_resp.dragged()
+    } else if right_grip_resp.dragged_by(eframe::egui::PointerButton::Primary)
         && let Some(pointer) = right_grip_resp.interact_pointer_pos()
     {
         interacted_with_overlay = true;
@@ -1627,11 +966,83 @@ fn show_day_overview_lane(
         eframe::egui::Stroke::new(2.0_f32, playhead_color),
     );
 
+    // The protruding playhead stays draggable even at a window resize grip.
+    let handle_painter = ui.painter_at(outer_rect.intersect(ui.clip_rect()));
+    let handle_y = outer_rect.top() + 3.0;
+    handle_painter.add(eframe::egui::Shape::convex_polygon(
+        vec![
+            eframe::egui::pos2(ph_x - 5.0, handle_y - 3.0),
+            eframe::egui::pos2(ph_x + 5.0, handle_y - 3.0),
+            eframe::egui::pos2(ph_x + 5.0, handle_y + 1.0),
+            eframe::egui::pos2(ph_x, rect.top()),
+            eframe::egui::pos2(ph_x - 5.0, handle_y + 1.0),
+        ],
+        playhead_color,
+        eframe::egui::Stroke::NONE,
+    ));
+    let playhead_hit = eframe::egui::Rect::from_center_size(
+        eframe::egui::pos2(ph_x, outer_rect.top() + 4.0),
+        eframe::egui::vec2(14.0, 8.0),
+    )
+    .intersect(outer_rect);
+    let playhead_response = ui
+        .interact(
+            playhead_hit,
+            ui.id().with("day_playhead_handle"),
+            eframe::egui::Sense::click_and_drag(),
+        )
+        .on_hover_cursor(eframe::egui::CursorIcon::ResizeHorizontal)
+        .on_hover_text("Move playhead");
+    if (playhead_response.clicked()
+        || playhead_response.dragged_by(eframe::egui::PointerButton::Primary))
+        && let Some(pointer) = playhead_response.interact_pointer_pos()
+    {
+        interacted_with_overlay = true;
+        let tl = router.timeline_mut();
+        tl.set_playing(false);
+        tl.set_setpoint(daqcore::time::Time::from_unix_millis(x_to_time(pointer.x)));
+    }
+
+    let window_rail = eframe::egui::Rect::from_min_max(
+        eframe::egui::pos2(vp_left, rect.bottom() + 1.0),
+        eframe::egui::pos2(vp_right, outer_rect.bottom()),
+    );
+    handle_painter.rect_filled(window_rail, 2.0, accent_color.gamma_multiply(0.6));
+    let window_response = ui
+        .interact(
+            window_rail,
+            ui.id().with("day_window_drag"),
+            eframe::egui::Sense::drag(),
+        )
+        .on_hover_cursor(eframe::egui::CursorIcon::Grab)
+        .on_hover_text("Move window");
+    let drag_offset_id = ui.id().with("day_window_drag_offset");
+    if window_response.drag_started_by(eframe::egui::PointerButton::Primary)
+        && let Some(pointer) = window_response.interact_pointer_pos()
+    {
+        let offset = x_to_time(pointer.x) - router.timeline().start_utc_ms();
+        ui.data_mut(|data| data.insert_temp(drag_offset_id, offset));
+    }
+    if window_response.dragged_by(eframe::egui::PointerButton::Primary)
+        && let Some(pointer) = window_response.interact_pointer_pos()
+    {
+        interacted_with_overlay = true;
+        let offset = ui
+            .data(|data| data.get_temp::<i64>(drag_offset_id))
+            .unwrap_or(0);
+        router
+            .timeline_mut()
+            .pan_to_start_ms(x_to_time(pointer.x) - offset);
+    }
+    if window_response.drag_stopped() {
+        ui.data_mut(|data| data.remove::<i64>(drag_offset_id));
+    }
+
     // Subtle lane badge at top-left
     painter.text(
         eframe::egui::pos2(rect.left() + 4.0, rect.bottom() - 2.0),
         eframe::egui::Align2::LEFT_BOTTOM,
-        "DAY OVERVIEW",
+        "TIMELINE",
         eframe::egui::FontId::monospace(8.5),
         theme.muted_text_color(),
     );
@@ -1706,24 +1117,48 @@ fn show_day_overview_lane(
         }
     }
 
+    let scrub_origin_id = ui.id().with("day_scrub_origin");
+    if lane_response.drag_started_by(eframe::egui::PointerButton::Primary) {
+        let began_in_window = ui
+            .input(|input| input.pointer.press_origin())
+            .is_some_and(|pos| vp_rect.contains(pos));
+        ui.data_mut(|data| data.insert_temp(scrub_origin_id, began_in_window));
+    }
     if !interacted_with_overlay
-        && (lane_response.dragged() || lane_response.clicked())
+        && (lane_response.dragged_by(eframe::egui::PointerButton::Primary)
+            || lane_response.clicked())
         && let Some(pointer) = lane_response.interact_pointer_pos()
     {
         let target_ms = x_to_time(pointer.x);
-        let span_ms = (router.timeline().end_utc_ms() - router.timeline().start_utc_ms()).max(100);
-        router
-            .timeline_mut()
-            .pan_to_start_ms(target_ms - span_ms / 2);
+        let scrubbing = if lane_response.dragged_by(eframe::egui::PointerButton::Primary) {
+            ui.data(|data| data.get_temp::<bool>(scrub_origin_id))
+                .unwrap_or(false)
+        } else {
+            vp_rect.contains(pointer)
+        };
+        if scrubbing {
+            let tl = router.timeline_mut();
+            tl.set_playing(false);
+            tl.set_setpoint(daqcore::time::Time::from_unix_millis(target_ms));
+        } else {
+            let span_ms = router.timeline().window_ms().max(100);
+            router
+                .timeline_mut()
+                .pan_to_start_ms(target_ms - span_ms / 2);
+        }
+    }
+
+    if lane_response.drag_stopped() {
+        ui.data_mut(|data| data.remove::<bool>(scrub_origin_id));
     }
 
     if lane_response.hovered() {
         let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
-        if scroll_y.abs() > 0.5
+        if scroll_y != 0.0
             && let Some(pointer) = ui.input(|i| i.pointer.hover_pos())
         {
             let anchor_ms = x_to_time(pointer.x);
-            let factor = if scroll_y > 0.0 { 0.8 } else { 1.25 };
+            let factor = ui::scroll_zoom_factor(scroll_y);
             router.timeline_mut().zoom_around_ms(anchor_ms, factor);
         }
     }
@@ -1733,199 +1168,85 @@ fn show_day_overview_lane(
         .map(|p| x_to_time(p.x))
         .unwrap_or_else(|| router.timeline().setpoint_utc_ms());
 
-    lane_response.context_menu(|ui| {
-        if ui
-            .button(format!(
-                "📍 Drop Bookmark at {}",
-                daqcore::time::Time::from_unix_millis(hover_time_ms).label()
-            ))
-            .clicked()
-        {
-            timeline_ui.open_new_at_timestamp(router, hover_time_ms);
-            ui.close();
-        }
-        if ui
-            .button("🏷 Create Interval Event from Active Viewport [start..end]")
-            .clicked()
-        {
-            timeline_ui.open_new_at_playhead(router, false);
-            ui.close();
-        }
-    });
-}
-
-fn show_active_window_scrub_lane(
-    ui: &mut eframe::egui::Ui,
-    router: &mut daqcore::router::VirtualTimelineRouter,
-    timeline_ui: &TimelineUiState,
-    accent_color: eframe::egui::Color32,
-) {
-    let win_start_ms = router.timeline().start_utc_ms();
-    let win_end_ms = router.timeline().end_utc_ms().max(win_start_ms + 1);
-    let win_span_ms = (win_end_ms - win_start_ms).max(1) as f64;
-    let overlapping_annotations: Vec<daqcore::storage::Annotation> = router
-        .query_annotations_in_range(win_start_ms..=win_end_ms)
-        .unwrap_or_default();
-
-    let scrub_height = 20.0;
-    let width = ui.available_width().max(16.0);
-    let (rect, background) = ui.allocate_exact_size(
-        eframe::egui::vec2(width, scrub_height),
-        eframe::egui::Sense::click_and_drag(),
-    );
-    let clip_rect = rect.intersect(ui.clip_rect());
-    let painter = ui.painter_at(clip_rect);
-
-    let theme = ui::theme::get_theme(ui.ctx());
-    painter.rect_filled(rect, 3.0, theme.canvas_color());
-
-    let pad_x = (rect.width() * 0.02).clamp(6.0, 20.0);
-    let area = rect.shrink2(eframe::egui::vec2(pad_x, 0.0));
-    let axis_y = area.bottom() - 12.0;
-
-    let time_to_x = |utc_ms: i64| -> f32 {
-        let frac = ((utc_ms - win_start_ms) as f64 / win_span_ms).clamp(0.0, 1.0) as f32;
-        area.left() + frac * area.width()
-    };
-    let x_to_time = |px: f32| -> i64 {
-        let frac = ((px - area.left()) / area.width().max(1.0)).clamp(0.0, 1.0) as f64;
-        win_start_ms + (frac * win_span_ms).round() as i64
-    };
-
-    // Stint strip (top 3px) and Fault onset ticks (2px vertical ticks) inside the active window
-    if timeline_ui.show_stints {
-        for ann in overlapping_annotations
-            .iter()
-            .filter(|a| a.category != "fault")
-        {
-            let ann_end = ann.end_utc_ms.unwrap_or(ann.start_utc_ms);
-            let x0 = time_to_x(ann.start_utc_ms.max(win_start_ms));
-            let x1 = time_to_x(ann_end.min(win_end_ms)).max(x0 + 3.0);
-            let color = parse_hex_color(&ann.color, accent_color);
-            let strip_rect = eframe::egui::Rect::from_min_max(
-                eframe::egui::pos2(x0, area.top() + 2.0),
-                eframe::egui::pos2(x1, area.top() + 5.0),
-            );
-            painter.rect_filled(strip_rect, 1.5, color.gamma_multiply(0.75));
-        }
-    }
-    if timeline_ui.show_faults {
-        let fault_color = eframe::egui::Color32::from_rgb(239, 68, 68);
-        let mut last_tick_px: Option<i32> = None;
-        for ann in overlapping_annotations
-            .iter()
-            .filter(|a| a.category == "fault")
-        {
-            if ann.start_utc_ms < win_start_ms || ann.start_utc_ms > win_end_ms {
-                continue;
-            }
-            let fx = time_to_x(ann.start_utc_ms);
-            let px_col = (fx.round() as i32) / 2;
-            if last_tick_px == Some(px_col) {
-                continue;
-            }
-            last_tick_px = Some(px_col);
-            painter.line_segment(
-                [
-                    eframe::egui::pos2(fx, area.top() + 2.0),
-                    eframe::egui::pos2(fx, axis_y - 1.0),
-                ],
-                eframe::egui::Stroke::new(1.5_f32, fault_color),
-            );
-        }
-    }
-
-    // Ruler axis line and timestamp ticks
-    painter.line_segment(
-        [
-            eframe::egui::pos2(area.left(), axis_y),
-            eframe::egui::pos2(area.right(), axis_y),
-        ],
-        ui.visuals().widgets.noninteractive.fg_stroke,
-    );
-
-    let tick_count = ((area.width() / 130.0).floor() as usize).clamp(2, 8);
-    for i in 0..=tick_count {
-        let frac = i as f64 / tick_count as f64;
-        let tick_ms = win_start_ms + (win_span_ms * frac).round() as i64;
-        let px = area.left() + (frac as f32) * area.width();
-        painter.line_segment(
-            [
-                eframe::egui::pos2(px, axis_y - 4.0),
-                eframe::egui::pos2(px, axis_y + 2.0),
-            ],
-            ui.visuals().widgets.noninteractive.fg_stroke,
+    let resizing = left_grip_resp.dragged_by(eframe::egui::PointerButton::Primary)
+        || right_grip_resp.dragged_by(eframe::egui::PointerButton::Primary)
+        || left_grip_resp.drag_stopped_by(eframe::egui::PointerButton::Primary)
+        || right_grip_resp.drag_stopped_by(eframe::egui::PointerButton::Primary);
+    if let Some(opacity) = timeline_ui.span_hint_opacity(ui.input(|input| input.time), resizing) {
+        let timeline = router.timeline();
+        let galley = painter.layout_no_wrap(
+            format_span_ms(
+                timeline
+                    .end_utc_ms()
+                    .saturating_sub(timeline.start_utc_ms()),
+            ),
+            eframe::egui::FontId::monospace(10.0),
+            theme.text_color().gamma_multiply(opacity),
         );
-        let align = if i == 0 {
-            eframe::egui::Align2::LEFT_TOP
-        } else if i == tick_count {
-            eframe::egui::Align2::RIGHT_TOP
-        } else {
-            eframe::egui::Align2::CENTER_TOP
-        };
-        painter.text(
-            eframe::egui::pos2(px, axis_y + 2.0),
-            align,
-            daqcore::time::Time::from_unix_millis(tick_ms).label(),
-            eframe::egui::FontId::monospace(9.5),
-            ui.visuals().text_color(),
+        let size = eframe::egui::vec2(
+            (galley.size().x + 12.0).min(rect.width()),
+            galley.size().y + 4.0,
         );
+        let min_center = rect.left() + size.x * 0.5;
+        let max_center = (rect.right() - size.x * 0.5).max(min_center);
+        let center_x = ((time_to_x(timeline.start_utc_ms()) + time_to_x(timeline.end_utc_ms()))
+            * 0.5)
+            .clamp(min_center, max_center);
+        let badge = eframe::egui::Rect::from_center_size(
+            eframe::egui::pos2(center_x, rect.center().y),
+            size,
+        );
+        // Paint only so the temporary badge never intercepts a drag.
+        painter.rect_filled(badge, 3.0, theme.panel_color().gamma_multiply(opacity));
+        painter.rect_stroke(
+            badge,
+            3.0,
+            eframe::egui::Stroke::new(1.0_f32, accent_color.gamma_multiply(opacity)),
+            eframe::egui::StrokeKind::Inside,
+        );
+        painter.galley(
+            badge.center() - galley.size() * 0.5,
+            galley,
+            theme.text_color().gamma_multiply(opacity),
+        );
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(33));
     }
 
-    // Playhead (`setpoint`) indicator on the Active Window Scrub Bar.
-    // Clicking or dragging anywhere on this bar smoothly scrubs the Playhead!
-    let playhead_color = if theme.is_light {
-        eframe::egui::Color32::from_rgb(217, 119, 6)
-    } else {
-        eframe::egui::Color32::from_rgb(250, 204, 21)
-    };
-    let timeline = router.timeline_mut();
-    let ph_px = time_to_x(timeline.setpoint_utc_ms());
-    let ph_y = area.top() + 7.0;
-    painter.line_segment(
-        [
-            eframe::egui::pos2(ph_px, rect.top() + 1.0),
-            eframe::egui::pos2(ph_px, rect.bottom() - 1.0),
-        ],
-        eframe::egui::Stroke::new(2.0_f32, playhead_color),
-    );
-    painter.circle_filled(eframe::egui::pos2(ph_px, ph_y), 5.0, playhead_color);
-    if theme.is_light {
-        painter.circle_stroke(
-            eframe::egui::pos2(ph_px, ph_y),
-            5.0,
-            eframe::egui::Stroke::new(1.0_f32, eframe::egui::Color32::from_rgb(120, 53, 15)),
-        );
-    }
-
-    if (background.clicked() || background.dragged())
-        && let Some(pointer) = background.interact_pointer_pos()
+    // Record grip changes in the same frame so releasing cannot look like a zoom.
+    if ui.input(|input| input.pointer.any_down())
+        && let Some(ruler) = &mut timeline_ui.ruler
     {
-        let new_sp = x_to_time(pointer.x);
-        timeline.set_setpoint(daqcore::time::Time::from_unix_millis(new_sp));
+        ruler.last_window = (
+            router.timeline().start_utc_ms(),
+            router.timeline().end_utc_ms(),
+        );
     }
-
-    if background.hovered() {
-        let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
-        if scroll_y.abs() > 0.5
-            && let Some(pointer) = ui.input(|i| i.pointer.hover_pos())
-        {
-            let anchor_ms = x_to_time(pointer.x);
-            let factor = if scroll_y > 0.0 { 0.8 } else { 1.25 };
-            timeline.zoom_around_ms(anchor_ms, factor);
-        }
+    if right_panning {
+        ui.ctx().set_cursor_icon(eframe::egui::CursorIcon::Grabbing);
     }
-
-    background.on_hover_text(
-        "Click or drag anywhere on this ruler to scrub the yellow Playhead · Scroll wheel to zoom",
-    );
-
-    painter.rect_stroke(
-        rect,
-        4.0,
-        ui.visuals().widgets.noninteractive.bg_stroke,
-        eframe::egui::StrokeKind::Inside,
-    );
+    lane_response.clone().on_hover_text("Right drag moves view");
+    if !right_panning {
+        lane_response.context_menu(|ui| {
+            if ui
+                .button(format!(
+                    "📍 Drop Bookmark at {}",
+                    daqcore::time::Time::from_unix_millis(hover_time_ms).label()
+                ))
+                .clicked()
+            {
+                timeline_ui.open_new_at_timestamp(router, hover_time_ms);
+                ui.close();
+            }
+            if ui
+                .button("🏷 Create Interval Event from Active Viewport [start..end]")
+                .clicked()
+            {
+                timeline_ui.open_new_at_playhead(router, false);
+                ui.close();
+            }
+        });
+    }
 }
 
 pub fn show_annotation_editor_modal(
@@ -2612,7 +1933,394 @@ mod tests {
     use super::*;
 
     #[test]
-    fn master_timeline_two_lanes_gap_folding_and_annotation_modal_render_cleanly() {
+    fn resize_span_hint_lingers_then_fades_and_expires() {
+        let mut state = TimelineUiState::default();
+        assert_eq!(state.span_hint_opacity(0.0, false), None);
+        assert_eq!(state.span_hint_opacity(10.0, true), Some(1.0));
+        // Holding the grip keeps the hint visible without a maximum drag duration.
+        assert_eq!(state.span_hint_opacity(100.0, true), Some(1.0));
+        assert_eq!(state.span_hint_opacity(100.0, false), Some(1.0));
+        assert_eq!(state.span_hint_opacity(102.4, false), Some(1.0));
+        assert_eq!(state.span_hint_opacity(102.75, false), Some(0.5));
+        assert_eq!(state.span_hint_opacity(103.0, false), None);
+        assert_eq!(state.span_hint_at, None);
+        assert_eq!(state.span_hint_opacity(104.0, true), Some(1.0));
+        state.reset_ruler();
+        assert_eq!(state.span_hint_opacity(104.0, false), None);
+    }
+
+    #[test]
+    fn resize_span_label_is_precise_and_short() {
+        for (span, expected) in [
+            (0, "Δt (0 ms)"),
+            (100, "Δt (100 ms)"),
+            (1_000, "Δt (1 s)"),
+            (1_234, "Δt (1 s 234 ms)"),
+            (90_001, "Δt (90 s 1 ms)"),
+        ] {
+            let label = format_span_ms(span);
+            assert_eq!(label, expected);
+            assert!(label.split_whitespace().count() <= 5);
+            assert!(
+                !label
+                    .chars()
+                    .any(|c| c.is_ascii_punctuation() && c != '(' && c != ')')
+            );
+        }
+    }
+
+    #[test]
+    fn timeline_ruler_keeps_live_scale_and_freezes_during_review() {
+        let t0 = daqcore::time::Time::from_unix_millis(1_700_000_000_000);
+        let mut timeline = daqcore::timeline::MasterTimeline::live(t0, 30.0).unwrap();
+        let mut state = TimelineUiState::default();
+        let initial = state.ruler_projection(
+            &timeline,
+            (t0.unix_millis() - 30_000, t0.unix_millis()),
+            &[],
+            false,
+        );
+        let initial_span = initial.day_end_ms() - initial.day_start_ms();
+        let initial_width = initial.time_to_fraction(timeline.end_utc_ms())
+            - initial.time_to_fraction(timeline.start_utc_ms());
+        for elapsed in [1_000, 30_000, 3_600_000] {
+            timeline.observe(t0.offset(elapsed));
+            let bounds = timeline.day_bounds_ms().unwrap();
+            let projection = state.ruler_projection(&timeline, bounds, &[bounds], false);
+            assert_eq!(
+                projection.day_end_ms() - projection.day_start_ms(),
+                initial_span
+            );
+            assert!((projection.time_to_fraction(timeline.setpoint_utc_ms()) - 0.85).abs() < 1e-5);
+            let width = projection.time_to_fraction(timeline.end_utc_ms())
+                - projection.time_to_fraction(timeline.start_utc_ms());
+            assert!((width - initial_width).abs() < 1e-5);
+        }
+
+        timeline.toggle_playing();
+        let frozen =
+            state.ruler_projection(&timeline, timeline.day_bounds_ms().unwrap(), &[], false);
+        timeline.observe(t0.offset(7_200_000));
+        let after =
+            state.ruler_projection(&timeline, timeline.day_bounds_ms().unwrap(), &[], false);
+        assert_eq!(
+            after, frozen,
+            "Incoming samples must not move a reviewing ruler"
+        );
+    }
+
+    #[test]
+    fn timeline_ruler_zoom_fit_and_drag_are_explicit() {
+        let mut timeline = daqcore::timeline::MasterTimeline::live(
+            daqcore::time::Time::from_unix_millis(100_000),
+            40.0,
+        )
+        .unwrap();
+        timeline.set_day_bounds_ms(Some((0, 100_000)));
+        timeline.snap_to_range_ms(20_000, 60_000);
+        let mut state = TimelineUiState::default();
+        let initial = state.ruler_projection(&timeline, (0, 100_000), &[], false);
+        timeline.zoom_around_ms(40_000, 0.5);
+        let zoomed = state.ruler_projection(&timeline, (0, 100_000), &[], false);
+        assert_eq!(zoomed.day_end_ms() - zoomed.day_start_ms(), 50_000);
+        assert_ne!(zoomed, initial);
+
+        timeline.set_end(daqcore::time::Time::from_unix_millis(55_000));
+        let dragging = state.ruler_projection(&timeline, (0, 100_000), &[], true);
+        assert_eq!(dragging, zoomed);
+        let released = state.ruler_projection(&timeline, (0, 100_000), &[], false);
+        assert_eq!(released, zoomed, "Releasing a grip must not jump the ruler");
+
+        // Review navigation can reveal older data without silently fitting everything.
+        timeline.pan_to_start_ms(0);
+        let panned = state.ruler_projection(&timeline, (0, 100_000), &[], false);
+        assert_eq!(panned.day_start_ms(), 0);
+        assert_eq!(panned.day_end_ms() - panned.day_start_ms(), 50_000);
+
+        timeline.snap_to_range_ms(0, 100_000);
+        state.reset_ruler();
+        let fitted = state.ruler_projection(&timeline, (0, 100_000), &[], false);
+        assert_eq!(fitted.day_start_ms(), 0);
+        assert_eq!(fitted.day_end_ms(), 100_000);
+    }
+
+    #[test]
+    fn timeline_ruler_does_not_refold_as_coverage_arrives() {
+        let mut timeline = daqcore::timeline::MasterTimeline::live(
+            daqcore::time::Time::from_unix_millis(1_000_000),
+            30.0,
+        )
+        .unwrap();
+        timeline.snap_to_range_ms(0, 100_000);
+        timeline.set_collapse_idle_gaps(true);
+        let mut state = TimelineUiState::default();
+        let initial = state.ruler_projection(
+            &timeline,
+            (0, 1_000_000),
+            &[(0, 100_000), (900_000, 1_000_000)],
+            false,
+        );
+        assert!(initial.is_folded());
+        let updated = state.ruler_projection(&timeline, (0, 2_000_000), &[(0, 2_000_000)], false);
+        assert_eq!(updated, initial);
+    }
+
+    #[test]
+    fn unified_lane_separates_playhead_window_drag_and_resize() {
+        use eframe::egui::{Event, Modifiers, PointerButton, Pos2, Rect, Vec2};
+
+        fn frame(
+            ctx: &eframe::egui::Context,
+            router: &mut daqcore::router::VirtualTimelineRouter,
+            events: Vec<Event>,
+        ) -> Rect {
+            let mut bounds = Rect::NOTHING;
+            let state_id = eframe::egui::Id::new("test_timeline_state");
+            let mut timeline_ui = ctx
+                .data_mut(|data| data.get_temp::<TimelineUiState>(state_id))
+                .unwrap_or_default();
+            let _ = ctx.run(
+                eframe::egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 200.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    eframe::egui::CentralPanel::default().show(ctx, |ui| {
+                        bounds = Rect::from_min_size(
+                            ui.next_widget_position(),
+                            Vec2::new(ui.available_width(), 43.0),
+                        );
+                        show_day_overview_lane(
+                            ui,
+                            router,
+                            &mut timeline_ui,
+                            &mut None,
+                            eframe::egui::Color32::LIGHT_BLUE,
+                        );
+                    });
+                },
+            );
+            ctx.data_mut(|data| data.insert_temp(state_id, timeline_ui));
+            bounds
+        }
+
+        fn drag(
+            ctx: &eframe::egui::Context,
+            router: &mut daqcore::router::VirtualTimelineRouter,
+            from: Pos2,
+            to: Pos2,
+        ) {
+            drag_button(ctx, router, from, to, PointerButton::Primary);
+        }
+
+        fn drag_button(
+            ctx: &eframe::egui::Context,
+            router: &mut daqcore::router::VirtualTimelineRouter,
+            from: Pos2,
+            to: Pos2,
+            button: PointerButton,
+        ) {
+            frame(ctx, router, vec![Event::PointerMoved(from)]);
+            frame(
+                ctx,
+                router,
+                vec![Event::PointerButton {
+                    pos: from,
+                    button,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                }],
+            );
+            frame(ctx, router, vec![Event::PointerMoved(to)]);
+            frame(
+                ctx,
+                router,
+                vec![Event::PointerButton {
+                    pos: to,
+                    button,
+                    pressed: false,
+                    modifiers: Modifiers::NONE,
+                }],
+            );
+        }
+
+        let ctx = eframe::egui::Context::default();
+        ui::theme::store_theme(&ctx, ui::theme::ThemeSelection::default().get_colors());
+        let mut router = daqcore::router::VirtualTimelineRouter::live(
+            daqcore::time::Time::from_unix_millis(100_000),
+            40.0,
+        )
+        .unwrap();
+        router.timeline_mut().set_day_bounds_ms(Some((0, 100_000)));
+        router.timeline_mut().snap_to_range_ms(20_000, 60_000);
+        let bounds = frame(&ctx, &mut router, vec![]);
+        let x = |fraction: f32| bounds.left() + bounds.width() * fraction;
+
+        // The top handle scrubs even when the playhead is at a resize edge.
+        drag(
+            &ctx,
+            &mut router,
+            Pos2::new(x(0.2), bounds.top() + 3.0),
+            Pos2::new(x(0.4), bounds.top() + 3.0),
+        );
+        assert!((router.timeline().setpoint_utc_ms() - 40_000).abs() < 200);
+        assert_eq!(router.timeline().start_utc_ms(), 20_000);
+        assert_eq!(router.timeline().end_utc_ms(), 60_000);
+
+        // Scrubbing the window body clamps at the edge instead of moving the window.
+        drag(
+            &ctx,
+            &mut router,
+            Pos2::new(x(0.4), bounds.top() + 22.0),
+            Pos2::new(x(0.9), bounds.top() + 22.0),
+        );
+        assert_eq!(router.timeline().setpoint_utc_ms(), 60_000);
+        assert_eq!(router.timeline().start_utc_ms(), 20_000);
+        assert_eq!(router.timeline().end_utc_ms(), 60_000);
+
+        // The bottom grip translates the window without changing its duration.
+        drag(
+            &ctx,
+            &mut router,
+            Pos2::new(x(0.4), bounds.bottom() - 3.0),
+            Pos2::new(x(0.5), bounds.bottom() - 3.0),
+        );
+        assert!((router.timeline().start_utc_ms() - 30_000).abs() < 200);
+        assert_eq!(router.timeline().window_ms(), 40_000);
+
+        let state_id = eframe::egui::Id::new("test_timeline_state");
+        assert!(
+            ctx.data(|data| data.get_temp::<TimelineUiState>(state_id))
+                .unwrap()
+                .span_hint_at
+                .is_none(),
+            "Scrubbing and panning must not show a resize hint"
+        );
+
+        // The side grip still resizes independently of the playhead handle.
+        let right_fraction = router.timeline().end_utc_ms() as f32 / 100_000.0;
+        drag(
+            &ctx,
+            &mut router,
+            Pos2::new(x(right_fraction), bounds.top() + 22.0),
+            Pos2::new(x(0.8), bounds.top() + 22.0),
+        );
+        assert!((router.timeline().end_utc_ms() - 80_000).abs() < 200);
+        assert!((router.timeline().start_utc_ms() - 30_000).abs() < 200);
+
+        assert!(
+            ctx.data(|data| data.get_temp::<TimelineUiState>(state_id))
+                .unwrap()
+                .span_hint_at
+                .is_some(),
+            "Resizing shows the temporary duration badge"
+        );
+
+        // Right dragging pans from the background or over either kind of handle.
+        for (fraction, y) in [
+            (0.1, bounds.top() + 22.0),
+            (0.3, bounds.top() + 22.0),
+            (0.8, bounds.top() + 22.0),
+            (0.7, bounds.top() + 3.0),
+            (0.5, bounds.bottom() - 3.0),
+        ] {
+            let before = (
+                router.timeline().start_utc_ms(),
+                router.timeline().end_utc_ms(),
+            );
+            let cursor_offset = router.timeline().setpoint_utc_ms() - before.0;
+            drag_button(
+                &ctx,
+                &mut router,
+                Pos2::new(x(fraction), y),
+                Pos2::new(x(fraction - 0.1), y),
+                PointerButton::Secondary,
+            );
+            assert!(
+                (router.timeline().start_utc_ms() - (before.0 - 10_000)).abs() < 200,
+                "Right drag at {fraction} moved {:?} to {:?}",
+                before,
+                (
+                    router.timeline().start_utc_ms(),
+                    router.timeline().end_utc_ms()
+                )
+            );
+            assert_eq!(
+                router.timeline().end_utc_ms() - router.timeline().start_utc_ms(),
+                before.1 - before.0
+            );
+            assert_eq!(
+                router.timeline().setpoint_utc_ms() - router.timeline().start_utc_ms(),
+                cursor_offset
+            );
+            assert!(
+                !eframe::egui::Popup::is_any_open(&ctx),
+                "Dragging must not open a menu"
+            );
+            // Restore the window for independent handle coverage.
+            router.timeline_mut().snap_to_range_ms(before.0, before.1);
+            router
+                .timeline_mut()
+                .set_setpoint(daqcore::time::Time::from_unix_millis(
+                    before.0 + cursor_offset,
+                ));
+            frame(&ctx, &mut router, vec![]);
+        }
+
+        // Resize edges carry the cursor instead of getting blocked when they overlap.
+        router
+            .timeline_mut()
+            .set_setpoint(daqcore::time::Time::from_unix_millis(80_000));
+        frame(&ctx, &mut router, vec![]);
+        drag(
+            &ctx,
+            &mut router,
+            Pos2::new(x(0.8), bounds.top() + 22.0),
+            Pos2::new(x(0.5), bounds.top() + 22.0),
+        );
+        assert!((router.timeline().end_utc_ms() - 50_000).abs() < 200);
+        assert_eq!(
+            router.timeline().setpoint_utc_ms(),
+            router.timeline().end_utc_ms()
+        );
+        assert!((router.timeline().start_utc_ms() - 30_000).abs() < 200);
+
+        let start = router.timeline().start();
+        router.timeline_mut().set_setpoint(start);
+        frame(&ctx, &mut router, vec![]);
+        drag(
+            &ctx,
+            &mut router,
+            Pos2::new(x(0.3), bounds.top() + 22.0),
+            Pos2::new(x(0.45), bounds.top() + 22.0),
+        );
+        assert!((router.timeline().start_utc_ms() - 45_000).abs() < 200);
+        assert_eq!(
+            router.timeline().setpoint_utc_ms(),
+            router.timeline().start_utc_ms()
+        );
+        assert!((router.timeline().end_utc_ms() - 50_000).abs() < 200);
+
+        // A stationary right click still opens the context menu without panning.
+        let before = (
+            router.timeline().start_utc_ms(),
+            router.timeline().setpoint_utc_ms(),
+        );
+        let pos = Pos2::new(x(0.1), bounds.top() + 22.0);
+        drag_button(&ctx, &mut router, pos, pos, PointerButton::Secondary);
+        assert_eq!(
+            (
+                router.timeline().start_utc_ms(),
+                router.timeline().setpoint_utc_ms()
+            ),
+            before
+        );
+        assert!(eframe::egui::Popup::is_any_open(&ctx));
+    }
+
+    #[test]
+    fn master_timeline_unified_lane_gap_folding_and_annotation_modal_render_cleanly() {
         let tmp_store = tempfile::tempdir().expect("temp store");
         let reg = daqcore::storage::Registry::open_store(tmp_store.path()).expect("open store");
         reg.upsert_track_day(&daqcore::storage::TrackDay {

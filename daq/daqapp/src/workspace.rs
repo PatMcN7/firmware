@@ -204,7 +204,6 @@ fn show_workspace_tabs_bar(app: &mut app::DAQApp, ctx: &eframe::egui::Context) {
 }
 
 pub fn show(app: &mut app::DAQApp, ctx: &eframe::egui::Context) {
-    ui::timeline::show(app, ctx);
     show_workspace_tabs_bar(app, ctx);
     app.router.poll_background_tiles();
     let start = app.router.timeline().start();
@@ -1129,7 +1128,6 @@ mod tests {
                     let full_output = ctx.run(raw_input, |ctx| {
                         ctx.set_style(app.theme.clone());
                         ui::sidebar::show(&mut app, ctx);
-                        ui::timeline::show(&mut app, ctx);
                         super::show(&mut app, ctx);
                     });
 
@@ -1162,7 +1160,6 @@ mod tests {
         let _ = ctx.run(tiny_input, |ctx| {
             ctx.set_style(app.theme.clone());
             ui::sidebar::show(&mut app, ctx);
-            ui::timeline::show(&mut app, ctx);
             super::show(&mut app, ctx);
         });
 
@@ -1197,11 +1194,13 @@ mod tests {
                     app.handle_action(act, ctx);
                 }
                 ui::sidebar::show(app, ctx);
-                ui::timeline::show(app, ctx);
                 super::show(app, ctx);
             });
         };
 
+        // Pause initial live-follow before exercising historical playback shortcuts.
+        app.router.timeline_mut().toggle_playing();
+        assert!(!app.router.timeline().is_live());
         assert!(!app.router.timeline().is_playing());
         send_key(
             &mut app,

@@ -567,6 +567,22 @@ impl VirtualTimelineRouter {
         }
     }
 
+    /// Leave historical playback and follow the newest sample from the live source.
+    pub fn go_live(&mut self) {
+        let Some((_, latest_ms)) = self.live_buffer.time_bounds_ms() else {
+            return;
+        };
+        self.timeline.set_active_track_day_id(None);
+        if let Some(sync) = &self.cloud_sync {
+            sync.set_active_track_day(None);
+        }
+        self.timeline.reset(Time::from_unix_millis(latest_ms));
+        let bounds = self
+            .captured_time_span()
+            .map(|(lo, hi)| (lo.unix_millis(), hi.unix_millis()));
+        self.timeline.set_day_bounds_ms(bounds);
+    }
+
     /// Clear live provisional history and reset the timeline to `now` while preserving
     /// registered canonical SD partitions.
     pub fn reset_live(&mut self, now: Time) {
@@ -1604,6 +1620,44 @@ mod tests {
             raw_bytes: payload,
             decoded,
         }
+    }
+
+    #[test]
+    fn go_live_resumes_ingestion_without_historical_day_filter() {
+        let db = router_test_database();
+        let t0 = Time::from_unix_millis(1_700_000_000_000);
+        let mut router = VirtualTimelineRouter::live(t0, 30.0).unwrap();
+        router.timeline_mut().toggle_playing();
+        router.go_live();
+        assert!(
+            !router.timeline().is_live(),
+            "No samples means no live jump"
+        );
+
+        router.ingest_frame(make_live_frame(
+            &db,
+            t0.unix_millis(),
+            200,
+            &[("car_state", 2.0)],
+        ));
+        router
+            .timeline_mut()
+            .set_active_track_day_id(Some("historical".to_owned()));
+        router.timeline_mut().snap_to_range_ms(1_000, 2_000);
+        router.go_live();
+        assert!(router.timeline().is_live());
+        assert_eq!(router.timeline().active_track_day_id(), None);
+        assert_eq!(router.timeline().setpoint(), t0);
+        assert_eq!(router.timeline().window_ms(), 1_000);
+
+        router.ingest_frame(make_live_frame(
+            &db,
+            t0.unix_millis() + 100,
+            200,
+            &[("car_state", 2.0)],
+        ));
+        assert!(router.timeline().is_live());
+        assert_eq!(router.timeline().setpoint(), t0.offset(100));
     }
 
     /// Milestone 3 Verification:

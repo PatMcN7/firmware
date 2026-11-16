@@ -1314,8 +1314,8 @@ impl Scope {
                     let (scroll, zoom_delta, shift_held) = plot_ui
                         .ctx()
                         .input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.modifiers.shift));
-                    if shift_held && scroll.y.abs() > 0.5 {
-                        let factor = if scroll.y > 0.0 { 0.8 } else { 1.25 };
+                    if shift_held && scroll.y != 0.0 {
+                        let factor = ui::scroll_zoom_factor(scroll.y);
                         let y_lo = active_y_min.min(active_y_max);
                         let y_hi = active_y_max.max(y_lo);
                         let cur_span = (y_hi - y_lo).max(1e-6);
@@ -1329,8 +1329,8 @@ impl Scope {
                     } else if (zoom_delta - 1.0).abs() > 1e-3 {
                         let factor = (1.0 / f64::from(zoom_delta)).clamp(0.25, 4.0);
                         view.request_zoom_around_ms(anchor_ms, factor);
-                    } else if scroll.y.abs() > 0.5 {
-                        let factor = if scroll.y > 0.0 { 0.8 } else { 1.25 };
+                    } else if scroll.y != 0.0 {
+                        let factor = ui::scroll_zoom_factor(scroll.y);
                         view.request_zoom_around_ms(anchor_ms, factor);
                     }
                     if scroll.x.abs() > 0.5 {

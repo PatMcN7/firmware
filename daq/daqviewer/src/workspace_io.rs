@@ -1746,7 +1746,23 @@ mod tests {
             )],
         );
         scope.config.stacked = true;
-        scope.config.lanes = 3;
+        scope.config.lanes = 12;
+        scope.config.plot_names.insert(2, "Powertrain".to_owned());
+        scope.add_channel(
+            "message.gear".to_owned(),
+            "Gear".to_owned(),
+            String::new(),
+            None,
+            false,
+        );
+        scope.config.channels.insert(
+            "message.gear".to_owned(),
+            SignalStyle {
+                lane: 2,
+                discrete: true,
+                ..Default::default()
+            },
+        );
         scope.config.channels.insert(
             "message.signal".to_owned(),
             SignalStyle {

@@ -467,6 +467,437 @@ fn browser_drop_assigns_the_target_lane() {
 }
 
 #[test]
+fn single_channels_icon_and_confirmed_plot_deletion() {
+    let mut h = Harness::new(true);
+    let count = h
+        .output
+        .as_ref()
+        .unwrap()
+        .shapes
+        .iter()
+        .filter(
+            |shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == "ƒ"),
+        )
+        .count();
+    assert_eq!(count, 1);
+    let delete = h.find("×");
+    assert!((delete.x - h.scope.plot_frames[0].left()).abs() <= 1.0);
+    assert!(h.find("Plot 1").x > delete.x);
+    h.frame(vec![Event::PointerMoved(delete)]);
+    assert!(h.output.as_ref().unwrap().shapes.iter().any(|shape| {
+        matches!(&shape.shape, egui::Shape::Text(text)
+            if text.galley.text() == "×" && text.galley.job.sections[0].format.color == egui::Color32::from_rgb(235, 75, 75))
+    }));
+    h.click(delete);
+    assert!(h.output.as_ref().unwrap().shapes.iter().any(|shape| {
+        matches!(&shape.shape, egui::Shape::Rect(rect)
+            if rect.rect.contains(delete) && rect.stroke.color == egui::Color32::from_rgb(70, 200, 110))
+    }));
+    assert_eq!(h.scope.config.lanes, 2);
+    let id = egui::Id::new(("scope_delete_confirmation", h.scope.instance_num));
+    assert_eq!(h.ctx.data_mut(|data| data.get_temp::<usize>(id)), Some(0));
+    assert!(h.output.as_ref().unwrap().shapes.iter().any(|shape| {
+        matches!(&shape.shape, egui::Shape::LineSegment { stroke, .. }
+            if stroke.color == egui::Color32::from_rgb(70, 200, 110))
+    }));
+    h.frame(vec![Event::Key {
+        key: egui::Key::Escape,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::NONE,
+    }]);
+    assert_eq!(h.ctx.data_mut(|data| data.get_temp::<usize>(id)), None);
+    h.click(delete);
+    h.click(h.point(0, 0.5));
+    assert_eq!(h.ctx.data_mut(|data| data.get_temp::<usize>(id)), None);
+    assert_eq!(h.scope.config.lanes, 2);
+    h.click(delete);
+    h.click(delete);
+    assert_eq!(h.scope.config.lanes, 1);
+    assert_eq!(h.ctx.data_mut(|data| data.get_temp::<usize>(id)), None);
+}
+
+#[test]
+fn deleting_plot_removes_channels_and_renumbers_axes() {
+    let mut h = Harness::new(true);
+    let remaining: Vec<_> = h
+        .scope
+        .channels
+        .iter()
+        .filter(|channel| h.scope.config.lane(&channel.signal_id) == 1)
+        .map(|channel| channel.signal_id.clone())
+        .collect();
+    assert!(!remaining.is_empty());
+    h.scope
+        .config
+        .axes
+        .entry("1|rpm".to_owned())
+        .or_default()
+        .range = Some([0.0, 4000.0]);
+    h.scope.delete_plot(0);
+    assert_eq!(h.scope.config.lanes, 1);
+    assert!(!h.scope.config.stacked);
+    assert_eq!(h.scope.channels.len(), remaining.len());
+    for signal in remaining {
+        assert!(
+            h.scope
+                .channels
+                .iter()
+                .any(|channel| channel.signal_id == signal)
+        );
+        assert_eq!(h.scope.config.lane(&signal), 0);
+    }
+    assert_eq!(h.scope.config.axes["0|rpm"].range, Some([0.0, 4000.0]));
+    h.frame(vec![]);
+    h.scope.delete_plot(0);
+    assert!(h.scope.channels.is_empty());
+    assert!(h.scope.picker_target.is_none());
+    h.frame(vec![]);
+}
+
+#[test]
+fn blank_scope_accepts_left_right_and_discrete_drops_without_picker() {
+    use ui::scope_settings::Destination;
+    for destination in [Destination::Left, Destination::Right, Destination::Discrete] {
+        let mut h = Harness::new(false);
+        h.scope = Scope::new_empty(1);
+        for _ in 0..3 {
+            h.frame(vec![]);
+        }
+        assert!(h.scope.picker_target.is_none());
+        assert_eq!(h.scope.plot_frames.len(), 1);
+        let frame = h.scope.plot_frames[0];
+        let point = match destination {
+            Destination::Left => egui::pos2(frame.left() + 20.0, frame.center().y),
+            Destination::Right => egui::pos2(frame.right() - 20.0, frame.center().y),
+            Destination::Discrete => egui::pos2(frame.center().x, frame.bottom() - 10.0),
+        };
+        h.press(egui::pos2(500.0, 17.0), PointerButton::Primary);
+        egui::DragAndDrop::set_payload(
+            &h.ctx,
+            ui::signal_browser::DraggedSignal::Derived {
+                signal_id: SPEED.to_owned(),
+                label: "Speed".to_owned(),
+                unit: "m/s".to_owned(),
+            },
+        );
+        h.frame(vec![Event::PointerMoved(point)]);
+        let request = h.release(point, PointerButton::Primary);
+        assert_eq!(request.cursor, None);
+        assert_eq!(h.scope.channels.len(), 1);
+        assert_eq!(
+            h.scope.config.destination(&h.scope.channels[0]),
+            destination
+        );
+        assert!(h.scope.picker_target.is_none());
+        h.frame(vec![]);
+        if destination == Destination::Discrete {
+            let _ = h.find("gps_speed");
+        }
+    }
+}
+
+#[test]
+fn channels_icon_opens_persistent_search_and_plot_names_are_editable() {
+    use ui::scope_settings::Destination;
+    let mut h = Harness::new(false);
+    h.scope = Scope::new_empty(1);
+    for _ in 0..3 {
+        h.frame(vec![]);
+    }
+    let title = h.find("Plot 1");
+    h.click(title);
+    h.frame(vec![Event::Text("Powertrain".to_owned())]);
+    assert_eq!(h.scope.plot_name(0), "Powertrain");
+    let icon = h.find("ƒ");
+    h.click(icon);
+    for _ in 0..3 {
+        h.frame(vec![]);
+    }
+    assert!(matches!(
+        h.scope.picker_target,
+        Some(ScopePickerTarget::Channels(0, Destination::Left))
+    ));
+    let right = h.find("Right");
+    h.click(right);
+    let candidate = h.find(&format!("{SPEED} [m/s]"));
+    h.click(candidate);
+    assert_eq!(h.scope.channels.len(), 1);
+    assert_eq!(
+        h.scope.config.destination(&h.scope.channels[0]),
+        Destination::Right
+    );
+    assert!(h.scope.picker_target.is_some());
+}
+
+#[test]
+fn stacks_beyond_eight_keep_plots_readable() {
+    let mut h = Harness::new(true);
+    h.scope.config.lanes = 12;
+    for _ in 0..3 {
+        h.frame(vec![]);
+    }
+    assert_eq!(h.scope.plot_frames.len(), 12);
+    for frame in &h.scope.plot_frames {
+        assert!(frame.height() >= 100.0);
+    }
+}
+
+#[test]
+fn browser_drop_on_right_edge_creates_independent_axis() {
+    for stacked in [false, true] {
+        let mut h = Harness::new(stacked);
+        let lane = usize::from(stacked);
+        let frame = h.scope.plot_frames[lane];
+        let target = egui::pos2(frame.right() - 15.0, frame.center().y);
+        h.press(egui::pos2(500.0, 17.0), PointerButton::Primary);
+        egui::DragAndDrop::set_payload(
+            &h.ctx,
+            ui::signal_browser::DraggedSignal::Derived {
+                signal_id: "right_signal".to_owned(),
+                label: "Right signal".to_owned(),
+                unit: "V".to_owned(),
+            },
+        );
+        h.frame(vec![Event::PointerMoved(target)]);
+        h.release(target, PointerButton::Primary);
+        let channel = h
+            .scope
+            .channels
+            .iter()
+            .find(|c| c.signal_id == "right_signal")
+            .unwrap();
+        let key = h.scope.config.axis_key(channel);
+        assert_eq!(h.scope.config.lane("right_signal"), lane);
+        assert_eq!(
+            h.scope.config.axes[&key].side,
+            ui::scope_settings::AxisSide::Right
+        );
+    }
+}
+
+#[test]
+fn signals_move_across_scopes_from_every_source_and_destination() {
+    use ui::scope_settings::Destination;
+    fn frame(
+        ctx: &egui::Context,
+        router: &daqcore::router::VirtualTimelineRouter,
+        source: &mut Scope,
+        target: &mut Scope,
+        events: Vec<Event>,
+        reverse: bool,
+    ) -> egui::FullOutput {
+        let view = workspace_view::WorkspaceDataView::new(router);
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    Pos2::ZERO,
+                    egui::vec2(1200.0, 650.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.columns(2, |columns| {
+                        if reverse {
+                            let _ = target.show(&mut columns[1], &view);
+                            let _ = source.show(&mut columns[0], &view);
+                        } else {
+                            let _ = source.show(&mut columns[0], &view);
+                            let _ = target.show(&mut columns[1], &view);
+                        }
+                    });
+                });
+            },
+        );
+        assert_eq!(view.requested_range_ms(), None);
+        assert_eq!(view.requested_setpoint_utc_ms(), None);
+        output
+    }
+    for reverse in [false, true] {
+        for source_kind in ["left", "right", "discrete", "legend"] {
+            for destination in [Destination::Left, Destination::Right, Destination::Discrete] {
+                let mut h = Harness::new(false);
+                let channel = h.scope.channels[0].clone();
+                let source_destination = match source_kind {
+                    "right" => Destination::Right,
+                    "discrete" => Destination::Discrete,
+                    _ => Destination::Left,
+                };
+                h.scope.config.assign(&channel, 0, source_destination);
+                h.scope.config.channels.get_mut(SPEED).unwrap().width = 3.2;
+                let key = h.scope.config.axis_key(&channel);
+                h.scope.config.axes.entry(key).or_default().range = Some([0.0, 50.0]);
+                let mut target = Scope::new_empty(2);
+                for _ in 0..3 {
+                    h.output = Some(frame(
+                        &h.ctx,
+                        &h.router,
+                        &mut h.scope,
+                        &mut target,
+                        vec![],
+                        reverse,
+                    ));
+                }
+                let start = h.find(if source_kind == "legend" || source_kind == "discrete" {
+                    "Speed"
+                } else {
+                    SPEED
+                });
+                let rect = target.plot_frames[0];
+                let end = match destination {
+                    Destination::Left => egui::pos2(rect.left() + 20.0, rect.center().y),
+                    Destination::Right => egui::pos2(rect.right() - 20.0, rect.center().y),
+                    Destination::Discrete => egui::pos2(rect.center().x, rect.bottom() - 10.0),
+                };
+                frame(
+                    &h.ctx,
+                    &h.router,
+                    &mut h.scope,
+                    &mut target,
+                    vec![Event::PointerMoved(start)],
+                    reverse,
+                );
+                frame(
+                    &h.ctx,
+                    &h.router,
+                    &mut h.scope,
+                    &mut target,
+                    vec![Event::PointerButton {
+                        pos: start,
+                        button: PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Modifiers::NONE,
+                    }],
+                    reverse,
+                );
+                for _ in 0..2 {
+                    frame(
+                        &h.ctx,
+                        &h.router,
+                        &mut h.scope,
+                        &mut target,
+                        vec![Event::PointerMoved(end)],
+                        reverse,
+                    );
+                }
+                assert!(
+                    egui::DragAndDrop::payload::<ui::scope_legend::SignalDrag>(&h.ctx).is_some(),
+                    "Drag starts from {source_kind} at {start:?} to {end:?} reverse {reverse} destination {destination:?}"
+                );
+                frame(
+                    &h.ctx,
+                    &h.router,
+                    &mut h.scope,
+                    &mut target,
+                    vec![Event::PointerButton {
+                        pos: end,
+                        button: PointerButton::Primary,
+                        pressed: false,
+                        modifiers: Modifiers::NONE,
+                    }],
+                    reverse,
+                );
+                frame(
+                    &h.ctx,
+                    &h.router,
+                    &mut h.scope,
+                    &mut target,
+                    vec![],
+                    reverse,
+                );
+                assert!(
+                    !h.scope.channels.iter().any(|ch| ch.signal_id == SPEED),
+                    "Source removed after accepted {source_kind} drag"
+                );
+                assert_eq!(target.channels.len(), 1);
+                assert_eq!(target.channels[0].signal_id, SPEED);
+                assert_eq!(target.channels[0].color, channel.color);
+                assert_eq!(target.config.style(SPEED).width, 3.2);
+                assert_eq!(target.config.destination(&target.channels[0]), destination);
+                if destination != Destination::Discrete {
+                    assert_eq!(
+                        target.config.axes[&target.config.axis_key(&target.channels[0])].range,
+                        Some([0.0, 50.0])
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn discrete_band_can_be_dragged_back_to_either_axis() {
+    use ui::scope_settings::Destination;
+    for (destination, gutter) in [Destination::Left, Destination::Right]
+        .into_iter()
+        .flat_map(|dest| [(dest, false), (dest, true)])
+    {
+        let mut h = Harness::new(false);
+        let channel = h.scope.channels[0].clone();
+        h.scope.config.assign(&channel, 0, Destination::Discrete);
+        for _ in 0..3 {
+            h.frame(vec![]);
+        }
+        let label = h.find("Speed");
+        let plot = h.scope.plot_frames[0];
+        let start = egui::pos2(
+            if gutter {
+                plot.left() - 20.0
+            } else {
+                plot.center().x
+            },
+            label.y + 20.0,
+        );
+        let end = egui::pos2(
+            if destination == Destination::Left {
+                plot.left() + 20.0
+            } else {
+                plot.right() - 20.0
+            },
+            plot.center().y,
+        );
+        h.press(start, PointerButton::Primary);
+        h.frame(vec![Event::PointerMoved(end)]);
+        h.frame(vec![Event::PointerMoved(end)]);
+        assert!(egui::DragAndDrop::payload::<ui::scope_legend::SignalDrag>(&h.ctx).is_some());
+        h.release(end, PointerButton::Primary);
+        h.frame(vec![]);
+        assert_eq!(
+            h.scope.config.destination(&h.scope.channels[0]),
+            destination
+        );
+    }
+}
+
+#[test]
+fn cancelled_signal_drag_leaves_source_unchanged() {
+    let mut h = Harness::new(false);
+    let original = h.scope.channels.len();
+    let start = h.find(SPEED);
+    h.press(start, PointerButton::Primary);
+    h.frame(vec![Event::PointerMoved(egui::pos2(500.0, 17.0))]);
+    assert!(egui::DragAndDrop::has_any_payload(&h.ctx));
+    h.frame(vec![Event::Key {
+        key: egui::Key::Escape,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::NONE,
+    }]);
+    h.release(egui::pos2(500.0, 17.0), PointerButton::Primary);
+    assert_eq!(h.scope.channels.len(), original);
+    assert!(
+        h.scope
+            .channels
+            .iter()
+            .any(|channel| channel.signal_id == SPEED)
+    );
+}
+
+#[test]
 fn distance_selection_maps_back_to_shared_timestamps() {
     let mut h = Harness::new(false);
     h.scope.x_axis_mode = ScopeXAxisMode::TrackDistance;
@@ -494,7 +925,7 @@ fn legend_appearance_axis_menus_and_lane_drag_work() {
     for _ in 0..2 {
         h.frame(vec![]);
     }
-    let speed = h.find(SPEED);
+    let speed = h.find("Speed");
     h.click(speed);
     let appearance = h.find("Appearance");
     h.click(appearance);
@@ -516,7 +947,7 @@ fn legend_appearance_axis_menus_and_lane_drag_work() {
     }]);
     egui::Popup::close_all(&h.ctx);
     h.frame(vec![]);
-    let speed = h.find(SPEED);
+    let speed = h.find("Speed");
     h.click(speed);
     let axis = h.find("Axis");
     h.click(axis);

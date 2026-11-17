@@ -16,12 +16,34 @@ pub(super) struct Entry {
     pub stats: Option<ChannelStats>,
     pub visible: bool,
     pub measurements: Option<(f64, f64)>,
+    pub drag: Option<SignalDrag>,
 }
 
 #[derive(Clone)]
 pub(super) struct SignalDrag {
     pub scope: usize,
-    pub signal: String,
+    pub channel: ScopeChannel,
+    pub style: ui::scope_settings::SignalStyle,
+    pub axis: ui::scope_settings::AxisConfig,
+}
+
+impl SignalDrag {
+    pub fn new(
+        scope: usize,
+        channel: &ScopeChannel,
+        config: &ui::scope_settings::ScopeConfig,
+    ) -> Self {
+        Self {
+            scope,
+            channel: channel.clone(),
+            style: config.style(&channel.signal_id),
+            axis: config
+                .axes
+                .get(&config.axis_key(channel))
+                .cloned()
+                .unwrap_or_default(),
+        }
+    }
 }
 
 pub(super) enum Action {
@@ -56,7 +78,15 @@ pub(super) fn toggle_button(ui: &mut egui::Ui, visible: bool) -> egui::Response 
 }
 
 pub(super) fn short_label(channel: &ScopeChannel) -> &str {
-    &channel.signal_id
+    if !channel.label.is_empty() && channel.label != channel.signal_id {
+        &channel.label
+    } else {
+        channel
+            .signal_id
+            .rsplit('.')
+            .next()
+            .unwrap_or(&channel.signal_id)
+    }
 }
 
 /// Render compact channel key pills inline in the Scope's wrapping header bar.
@@ -109,8 +139,13 @@ pub(super) fn show_toolbar_strip(
         let value_w = value_galley.as_ref().map_or(0.0, |g| g.size().x + 5.0);
         let pill_w = swatch_w + pad_x + label_galley.size().x + value_w + pad_x + eye_w + 2.0;
 
-        let (pill_rect, response) =
-            ui.allocate_exact_size(egui::vec2(pill_w, strip_height), egui::Sense::click());
+        let (pill_rect, response) = ui.allocate_exact_size(
+            egui::vec2(pill_w, strip_height),
+            egui::Sense::click_and_drag(),
+        );
+        if let Some(payload) = &entry.drag {
+            response.dnd_set_drag_payload(payload.clone());
+        }
         let bg_fill = if response.hovered() {
             ui.visuals().widgets.hovered.weak_bg_fill
         } else {
@@ -136,16 +171,16 @@ pub(super) fn show_toolbar_strip(
             egui::pos2(pill_rect.left() + 3.0, pill_rect.top()),
             egui::vec2(swatch_w, pill_rect.height()),
         );
-        ui.interact(
-            swatch_rect,
-            ui.id().with(("toolbar_signal_drag", index)),
-            egui::Sense::drag(),
-        )
-        .on_hover_text("Drag signal between plots")
-        .dnd_set_drag_payload(SignalDrag {
-            scope: instance,
-            signal: entry.signal_id.clone(),
-        });
+        let swatch_response = ui
+            .interact(
+                swatch_rect,
+                ui.id().with(("toolbar_signal_drag", index)),
+                egui::Sense::drag(),
+            )
+            .on_hover_text("Drag signal between plots");
+        if let Some(payload) = &entry.drag {
+            swatch_response.dnd_set_drag_payload(payload.clone());
+        }
         paint_swatch(
             ui,
             swatch_rect,
@@ -215,16 +250,85 @@ pub(super) fn show_toolbar_strip(
     action
 }
 
-pub(super) fn bounds(plot: Rect, rows: usize, statistics: bool) -> Option<Rect> {
-    if rows == 0 || plot.width() < 96.0 || plot.height() < 48.0 {
+const ROW_HEIGHT: f32 = 18.0;
+const ROW_GAP: f32 = 1.0;
+const FRAME_PADDING: f32 = 10.0;
+
+pub(super) fn bounds(
+    ctx: &egui::Context,
+    plot: Rect,
+    entries: &[Entry],
+    statistics: bool,
+) -> Option<Rect> {
+    if entries.is_empty() || plot.width() < 96.0 || plot.height() < 48.0 {
         return None;
     }
-    let width = (plot.width() * 0.40)
-        .clamp(150.0, 290.0)
+    // Keep the eye hit area reserved so hovering never shifts the readouts.
+    let content_width = ctx.fonts_mut(|fonts| {
+        entries
+            .iter()
+            .map(|entry| {
+                let name = fonts
+                    .layout_no_wrap(
+                        entry.label.clone(),
+                        egui::FontId::proportional(11.0),
+                        Color32::WHITE,
+                    )
+                    .size()
+                    .x;
+                let value = entry.value.as_ref().map_or(0.0, |value| {
+                    fonts
+                        .layout_no_wrap(
+                            value.clone(),
+                            egui::FontId::monospace(10.5),
+                            Color32::WHITE,
+                        )
+                        .size()
+                        .x
+                });
+                let mut width = 18.0
+                    + name
+                    + if entry.value.is_some() {
+                        8.0 + value
+                    } else {
+                        0.0
+                    }
+                    + 24.0;
+                if statistics && let Some(stats) = entry.stats {
+                    let stats_width: f32 =
+                        [("Min", stats.min), ("Max", stats.max), ("Mean", stats.mean)]
+                            .into_iter()
+                            .map(|(label, value)| {
+                                fonts
+                                    .layout_no_wrap(
+                                        format!("{label} ({value:.2})"),
+                                        egui::FontId::proportional(9.0),
+                                        Color32::WHITE,
+                                    )
+                                    .size()
+                                    .x
+                                    + 4.0
+                            })
+                            .sum();
+                    width = width.max(stats_width);
+                }
+                width
+            })
+            .fold(0.0_f32, f32::max)
+    });
+    let width_cap = (plot.width() * 0.5)
+        .clamp(80.0, 320.0)
         .min(plot.width() - 16.0);
-    let row_height = if statistics { 30.0 } else { 18.0 };
-    let height = (rows as f32 * row_height + 10.0)
-        .min((plot.height() * 0.35).clamp(28.0, 140.0))
+    let width =
+        (((content_width + FRAME_PADDING) / 8.0).ceil() * 8.0).clamp(80.0, width_cap.max(80.0));
+    let rows = entries.len()
+        + if statistics {
+            entries.iter().filter(|entry| entry.stats.is_some()).count()
+        } else {
+            0
+        };
+    let height = (rows as f32 * (ROW_HEIGHT + ROW_GAP) - ROW_GAP + FRAME_PADDING)
+        .min((plot.height() * 0.33).clamp(28.0, 144.0))
         .min(plot.height() - 16.0);
     Some(Rect::from_min_size(
         plot.left_bottom() + egui::vec2(8.0, -height - 8.0),
@@ -238,7 +342,6 @@ pub(super) fn show(
     instance: usize,
     entries: &[Entry],
     statistics: bool,
-    scope_instance: usize,
 ) -> Option<Action> {
     let theme = ui::theme::get_theme(ui.ctx());
     let mut action = None;
@@ -253,6 +356,7 @@ pub(super) fn show(
         .show(ui.ctx(), |overlay| {
             overlay.set_width(rect.width());
             overlay.set_clip_rect(clip);
+            let reveal_controls = overlay.rect_contains_pointer(rect);
             egui::Frame::new()
                 .inner_margin(4)
                 .corner_radius(4.0)
@@ -262,19 +366,22 @@ pub(super) fn show(
                     theme.border_color().gamma_multiply(0.8),
                 ))
                 .show(overlay, |ui| {
-                    ui.set_width((rect.width() - 10.0).max(1.0));
+                    ui.set_width((rect.width() - FRAME_PADDING).max(1.0));
                     egui::ScrollArea::vertical()
                         .id_salt(("scope_legend_scroll", instance))
-                        .max_height((rect.height() - 10.0).max(1.0))
+                        .max_height((rect.height() - FRAME_PADDING).max(1.0))
                         .min_scrolled_height(0.0)
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            ui.spacing_mut().item_spacing.y = 1.0;
+                            ui.spacing_mut().item_spacing.y = ROW_GAP;
                             for (index, entry) in entries.iter().enumerate() {
                                 let (row, response) = ui.allocate_exact_size(
-                                    egui::vec2(ui.available_width(), 17.0),
-                                    egui::Sense::click(),
+                                    egui::vec2(ui.available_width(), ROW_HEIGHT),
+                                    egui::Sense::click_and_drag(),
                                 );
+                                if let Some(payload) = &entry.drag {
+                                    response.dnd_set_drag_payload(payload.clone());
+                                }
                                 if response.hovered() {
                                     ui.painter().rect_filled(
                                         row,
@@ -302,28 +409,36 @@ pub(super) fn show(
                                     } else {
                                         "Show signal"
                                     });
-                                paint_eye(ui, eye_rect, entry.visible, text_color);
+                                if reveal_controls
+                                    || eye_response.has_focus()
+                                    || eye_response.is_pointer_button_down_on()
+                                {
+                                    paint_eye(ui, eye_rect, entry.visible, text_color);
+                                }
                                 if eye_response.clicked() {
                                     action = Some(Action::Toggle(entry.channel_index));
                                 }
                                 let swatch = Rect::from_min_size(
                                     row.left_top(),
-                                    egui::vec2(16.0, row.height()),
+                                    egui::vec2(14.0, row.height()),
                                 );
-                                ui.interact(
-                                    swatch,
-                                    ui.id().with(("signal_drag", index)),
-                                    egui::Sense::drag(),
-                                )
-                                .on_hover_text("Drag signal between plots")
-                                .dnd_set_drag_payload(SignalDrag {
-                                    scope: scope_instance,
-                                    signal: entry.signal_id.clone(),
-                                });
+                                let swatch_response = ui
+                                    .interact(
+                                        swatch,
+                                        ui.id().with(("signal_drag", index)),
+                                        egui::Sense::drag(),
+                                    )
+                                    .on_hover_text("Move signal");
+                                if let Some(payload) = &entry.drag {
+                                    swatch_response.dnd_set_drag_payload(payload.clone());
+                                }
                                 let value_right = eye_rect.left() - 4.0;
                                 paint_swatch(
                                     ui,
-                                    swatch,
+                                    Rect::from_min_size(
+                                        row.left_top(),
+                                        egui::vec2(14.0, row.height()),
+                                    ),
                                     if entry.visible {
                                         entry.color
                                     } else {
@@ -338,13 +453,28 @@ pub(super) fn show(
                                         text_color,
                                     )
                                 });
-                                let value_width = value
-                                    .as_ref()
-                                    .map_or(0.0, |galley| galley.size().x.min(row.width() * 0.48));
+                                let reserved_name = ui
+                                    .painter()
+                                    .layout_no_wrap(
+                                        entry.label.clone(),
+                                        egui::FontId::proportional(11.0),
+                                        text_color,
+                                    )
+                                    .size()
+                                    .x
+                                    .min(40.0);
+                                let value_width = value.as_ref().map_or(0.0, |galley| {
+                                    galley
+                                        .size()
+                                        .x
+                                        .min((row.width() - 50.0 - reserved_name).max(0.0))
+                                });
+                                let value_gap = if value.is_some() { 8.0 } else { 0.0 };
                                 let label_rect = Rect::from_min_max(
-                                    row.left_top() + egui::vec2(20.0, 0.0),
+                                    row.left_top() + egui::vec2(18.0, 0.0),
                                     egui::pos2(
-                                        (value_right - value_width - 6.0).max(row.left() + 20.0),
+                                        (value_right - value_width - value_gap)
+                                            .max(row.left() + 18.0),
                                         row.bottom(),
                                     ),
                                 );
@@ -533,26 +663,59 @@ fn paint_swatch(ui: &egui::Ui, rect: Rect, color: Color32, style: egui_plot::Lin
 mod tests {
     use super::*;
 
-    #[test]
-    fn visible_panel_has_equal_side_and_bottom_insets() {
+    fn context() -> egui::Context {
         let ctx = egui::Context::default();
         ui::theme::store_theme(&ctx, ui::theme::ThemeSelection::default().get_colors());
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        ctx
+    }
+
+    fn entries(rows: usize) -> Vec<Entry> {
+        (0..rows)
+            .map(|index| Entry {
+                channel_index: index,
+                label: format!("Signal {index}"),
+                signal_id: format!("message.signal_{index}"),
+                value: Some("12.34 V".to_owned()),
+                color: Color32::LIGHT_BLUE,
+                style: egui_plot::LineStyle::Solid,
+                stats: None,
+                visible: true,
+                measurements: None,
+                drag: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn legend_fits_content_without_wasting_width() {
+        let ctx = context();
+        let plot = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 700.0));
+        let one = entries(1);
+        let short = bounds(&ctx, plot, &one, false).unwrap();
+        assert!(
+            short.width() < 200.0,
+            "Short legends should not reserve a 320 point box"
+        );
+        assert_eq!(short.height(), 28.0);
+        assert_eq!(
+            bounds(&ctx, plot, &one, true).unwrap(),
+            short,
+            "Unavailable statistics must not reserve blank rows"
+        );
+        let mut long = one.clone();
+        long[0].label = "A much longer descriptive signal name".to_owned();
+        assert!(bounds(&ctx, plot, &long, false).unwrap().width() > short.width());
+        assert!(bounds(&ctx, plot, &entries(2), false).unwrap().height() <= 47.0);
+    }
+
+    #[test]
+    fn visible_panel_has_equal_side_and_bottom_insets() {
+        let ctx = context();
         let plot = Rect::from_min_size(egui::pos2(30.0, 20.0), egui::vec2(600.0, 400.0));
         for rows in [1, 2, 20] {
-            let entries: Vec<_> = (0..rows)
-                .map(|index| Entry {
-                    channel_index: index,
-                    label: format!("message.signal_{index}"),
-                    signal_id: format!("message.signal_{index}"),
-                    value: None,
-                    color: Color32::LIGHT_BLUE,
-                    style: egui_plot::LineStyle::Solid,
-                    stats: None,
-                    visible: true,
-                    measurements: None,
-                })
-                .collect();
-            let rect = bounds(plot, rows, false).unwrap();
+            let entries = entries(rows);
+            let rect = bounds(&ctx, plot, &entries, false).unwrap();
             let mut panel = None;
             for pass in 0..3 {
                 let output = ctx.run(
@@ -566,13 +729,13 @@ mod tests {
                     },
                     |ctx| {
                         egui::CentralPanel::default().show(ctx, |ui| {
-                            show(ui, rect, rows, &entries, false, rows);
+                            show(ui, rect, rows, &entries, false);
                         });
                     },
                 );
                 panel = output.shapes.iter().find_map(|shape| match &shape.shape {
                     egui::Shape::Rect(shape)
-                        if shape.rect.width() >= 140.0 && shape.rect.width() <= 300.0 =>
+                        if shape.rect.width() >= 80.0 && shape.rect.width() <= 330.0 =>
                     {
                         Some(shape.rect)
                     }
@@ -591,26 +754,77 @@ mod tests {
     }
 
     #[test]
+    fn hover_reveals_eyes_without_changing_geometry() {
+        let ctx = context();
+        let entries = entries(2);
+        let plot = Rect::from_min_size(egui::pos2(30.0, 20.0), egui::vec2(600.0, 400.0));
+        let rect = bounds(&ctx, plot, &entries, false).unwrap();
+        for (hover, point) in [(false, egui::pos2(700.0, 50.0)), (true, rect.center())] {
+            let mut eyes = 0;
+            for _ in 0..3 {
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(800.0, 600.0),
+                        )),
+                        events: vec![egui::Event::PointerMoved(point)],
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            show(ui, rect, 1, &entries, false);
+                        });
+                    },
+                );
+                eyes = output
+                    .shapes
+                    .iter()
+                    .filter(|shape| {
+                        matches!(&shape.shape,
+                    egui::Shape::Path(path) if path.points.len() == 9)
+                    })
+                    .count();
+            }
+            assert_eq!(eyes > 0, hover);
+            assert_eq!(bounds(&ctx, plot, &entries, false).unwrap(), rect);
+        }
+    }
+
+    #[test]
     fn legend_is_bounded_and_anchored_bottom_left() {
+        let ctx = context();
         for size in [egui::vec2(240.0, 120.0), egui::vec2(1200.0, 700.0)] {
             let plot = Rect::from_min_size(egui::pos2(30.0, 20.0), size);
             for rows in [1, 3, 100] {
-                for stats in [false, true] {
-                    let legend = bounds(plot, rows, stats).unwrap();
+                for statistics in [false, true] {
+                    let mut entries = entries(rows);
+                    if statistics {
+                        for entry in &mut entries {
+                            entry.stats = Some(ChannelStats {
+                                min: 0.0,
+                                max: 10.0,
+                                mean: 5.0,
+                                cursor: Some(5.0),
+                            });
+                        }
+                    }
+                    let legend = bounds(&ctx, plot, &entries, statistics).unwrap();
                     assert!(plot.contains_rect(legend));
                     assert_eq!(
                         legend.left_bottom(),
                         plot.left_bottom() + egui::vec2(8.0, -8.0)
                     );
-                    assert!(legend.width() <= 290.0);
-                    assert!(legend.height() <= 140.0);
+                    assert!(legend.width() <= 320.0);
+                    assert!(legend.height() <= 144.0);
                 }
             }
         }
         assert!(
             bounds(
+                &ctx,
                 Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(60.0, 40.0)),
-                1,
+                &entries(1),
                 false
             )
             .is_none()

@@ -42,6 +42,7 @@ pub struct SignalStyle {
     pub envelope: bool,
     pub axis: String,
     pub lane: usize,
+    pub discrete: bool,
 }
 impl Default for SignalStyle {
     fn default() -> Self {
@@ -53,6 +54,7 @@ impl Default for SignalStyle {
             envelope: true,
             axis: String::new(),
             lane: 0,
+            discrete: false,
         }
     }
 }
@@ -89,7 +91,24 @@ pub struct ScopeConfig {
     pub lanes: usize,
     pub channels: BTreeMap<String, SignalStyle>,
     pub axes: BTreeMap<String, AxisConfig>,
+    #[serde(deserialize_with = "deserialize_plot_names")]
+    pub plot_names: BTreeMap<usize, String>,
 }
+// PaneSpec's tagged-enum deserializer buffers JSON object keys as strings.
+fn deserialize_plot_names<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<usize, String>, D::Error> {
+    let names = <BTreeMap<String, String> as serde::Deserialize>::deserialize(deserializer)?;
+    names
+        .into_iter()
+        .map(|(key, name)| {
+            key.parse::<usize>()
+                .map(|lane| (lane, name))
+                .map_err(serde::de::Error::custom)
+        })
+        .collect()
+}
+
 impl Default for ScopeConfig {
     fn default() -> Self {
         Self {
@@ -97,6 +116,7 @@ impl Default for ScopeConfig {
             lanes: 2,
             channels: BTreeMap::new(),
             axes: BTreeMap::new(),
+            plot_names: BTreeMap::new(),
         }
     }
 }
@@ -131,17 +151,55 @@ impl ScopeConfig {
     pub fn toggle_stack(&mut self, channels: &[ScopeChannel]) {
         self.stacked = !self.stacked;
         if self.stacked && !channels.iter().any(|ch| self.style(&ch.signal_id).lane > 0) {
-            self.lanes = 2;
+            self.lanes = self.lanes.max(2);
             for (index, channel) in channels.iter().enumerate() {
                 self.channels
                     .entry(channel.signal_id.clone())
                     .or_default()
-                    .lane = index % 2;
+                    .lane = index % self.lanes;
             }
         }
     }
+    pub fn assign(&mut self, channel: &ScopeChannel, lane: usize, destination: Destination) {
+        let style = self.channels.entry(channel.signal_id.clone()).or_default();
+        style.lane = lane;
+        style.discrete = destination == Destination::Discrete;
+        if style.discrete {
+            style.axis = format!("discrete:{}", channel.signal_id);
+        } else {
+            let side = if destination == Destination::Right {
+                "right"
+            } else {
+                "left"
+            };
+            style.axis = format!("{side}:{}", channel.unit);
+            self.axes
+                .entry(format!("{lane}|{}", style.axis))
+                .or_default()
+                .side = if destination == Destination::Right {
+                AxisSide::Right
+            } else {
+                AxisSide::Left
+            };
+        }
+    }
+
+    pub fn destination(&self, channel: &ScopeChannel) -> Destination {
+        if self.style(&channel.signal_id).discrete {
+            Destination::Discrete
+        } else if self
+            .axes
+            .get(&self.axis_key(channel))
+            .is_some_and(|axis| axis.side == AxisSide::Right)
+        {
+            Destination::Right
+        } else {
+            Destination::Left
+        }
+    }
+
     pub fn sanitize(&mut self) {
-        self.lanes = self.lanes.clamp(1, 8);
+        self.lanes = self.lanes.max(1);
         for style in self.channels.values_mut() {
             style.width = if style.width.is_finite() {
                 style.width.clamp(0.5, 8.0)
@@ -159,6 +217,22 @@ impl ScopeConfig {
             if axis.valid_range().is_none() {
                 axis.range = None;
             }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Destination {
+    Left,
+    Right,
+    Discrete,
+}
+impl Destination {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Left => "Left",
+            Self::Right => "Right",
+            Self::Discrete => "Discrete",
         }
     }
 }
@@ -379,8 +453,8 @@ mod tests {
     fn configuration_defaults_and_validation_are_safe() {
         let mut config: ScopeConfig = serde_json::from_str(r#"{"lanes":999,"channels":{"a":{"width":-2,"opacity":4,"lane":99}} ,"axes":{"0|V":{"range":[5,1]}}}"#).unwrap();
         config.sanitize();
-        assert_eq!(config.lanes, 8);
-        assert_eq!(config.style("a").lane, 7);
+        assert_eq!(config.lanes, 999);
+        assert_eq!(config.style("a").lane, 99);
         assert_eq!(config.style("a").width, 0.5);
         assert_eq!(config.style("a").opacity, 1.0);
         assert_eq!(config.axes["0|V"].range, None);

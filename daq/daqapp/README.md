@@ -37,6 +37,20 @@ DaqApp is PER's complete trackside data acquisition and analysis desktop applica
 
 Sidebar settings (source, SuperDBC, etc) are saved to a local settings file to persist between sessions.
 
+## Scope graphs
+
+- New scopes start as blank plots. Click a plot title to rename it; names are saved with the workspace.
+- The single **ƒ** channels icon in the scope toolbar opens a searchable selector with **Left**, **Right**, and **Discrete** destinations. It stays open for repeated selection, and lists assigned signals with reassignment/removal controls.
+- Drag channels onto the labeled **Left axis**, **Right axis**, or bottom **Discrete** drop zones. Discrete channels render labeled state strips aligned with the graph's time axis. State strips show no-data gaps and support shared cursor hover/click; they are unavailable in comparison mode.
+- Click the plot to move the shared playhead. Left drag selects a range and shows its statistics. Escape clears the selection.
+- Right drag selects a time range to zoom. Scroll zooms time, Shift scroll zooms Y, and double click resets the local Y zoom.
+- Scroll sideways through the single-row toolbar legend, or use the legend icon to open the bottom-left overlay. Eye icons temporarily hide signals without deleting them or changing their colors.
+- Click a legend entry, then **Appearance**, **Assignment**, or **Axis** to open its settings. Configure color, opacity, width, lines, points, stepped rendering, plot assignment, and independent Auto or Fixed axes.
+- The stacked plots icon splits signals into aligned lanes. **+ Plot** adds another lane without a fixed count limit; tall stacks scroll vertically. Drag an axis signal label, a discrete strip, or a legend entry into another plot in this or another scope to move that signal. The Left, Right, or Discrete drop zone sets its new assignment. Colour, appearance, and custom axis ranges travel with the signal; cancelled drags leave the source unchanged. The scope menu also contains plot count and layout controls.
+- Each plot's **×** turns red on hover. Click it to reveal a green **✓**, then click again to delete the plot and its signals from this widget, not the underlying data. Clicking elsewhere or pressing Escape cancels confirmation. Deleting the last plot leaves a blank plot.
+- The measurement icon enables A and B cursors. Click twice to pin them, then drag either cursor line. The plots show the time difference and legends show signal differences. Missing or offscreen measurements are not interpolated across gaps.
+- Appearance, axes, and lane assignments are stored in workspace presets. Temporary visibility and measurement cursors are session state.
+
 ## Getting started
 
 Install Rust/Cargo and the platform prerequisites described in the repository

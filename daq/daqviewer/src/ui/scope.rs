@@ -183,6 +183,7 @@ struct ScopeCacheKey {
     channel_specs: Vec<(String, String, String, eframe::egui::Color32)>,
     data_revision: u64,
     configuration: String,
+    inverter_tiles: bool,
 }
 
 enum ChannelCursorLookup {
@@ -263,6 +264,9 @@ pub struct Scope {
     lane_y_overrides: std::collections::BTreeMap<usize, (f64, f64)>,
     plot_frames: Vec<eframe::egui::Rect>,
     hidden_channels: std::collections::HashSet<String>,
+    solo_channel: Option<String>,
+    inverter_tiles: bool,
+    inverter_y_bounds: Option<(f64, f64)>,
     y_bounds_override: Option<(f64, f64)>,
     cached_data: Option<CachedScopeData>,
 }
@@ -295,6 +299,9 @@ impl Scope {
             show_inline_stats: false,
             show_legend: false,
             hidden_channels: std::collections::HashSet::new(),
+            solo_channel: None,
+            inverter_tiles: false,
+            inverter_y_bounds: None,
             config: ui::scope_settings::ScopeConfig::default(),
             inspector: None,
             gesture: None,
@@ -319,6 +326,9 @@ impl Scope {
             show_inline_stats: false,
             show_legend: false,
             hidden_channels: std::collections::HashSet::new(),
+            solo_channel: None,
+            inverter_tiles: false,
+            inverter_y_bounds: None,
             config: ui::scope_settings::ScopeConfig::default(),
             inspector: None,
             gesture: None,
@@ -357,6 +367,9 @@ impl Scope {
             show_inline_stats: false,
             show_legend: false,
             hidden_channels: std::collections::HashSet::new(),
+            solo_channel: None,
+            inverter_tiles: false,
+            inverter_y_bounds: None,
             config: ui::scope_settings::ScopeConfig::default(),
             inspector: None,
             gesture: None,
@@ -396,6 +409,9 @@ impl Scope {
             show_inline_stats: false,
             show_legend: false,
             hidden_channels: std::collections::HashSet::new(),
+            solo_channel: None,
+            inverter_tiles: false,
+            inverter_y_bounds: None,
             config: ui::scope_settings::ScopeConfig::default(),
             inspector: None,
             gesture: None,
@@ -428,6 +444,9 @@ impl Scope {
             show_inline_stats: false,
             show_legend: false,
             hidden_channels: std::collections::HashSet::new(),
+            solo_channel: None,
+            inverter_tiles: false,
+            inverter_y_bounds: None,
             config: ui::scope_settings::ScopeConfig::default(),
             inspector: None,
             gesture: None,
@@ -506,6 +525,9 @@ impl Scope {
         if index < self.channels.len() {
             let removed = self.channels.remove(index);
             self.hidden_channels.remove(&removed.signal_id);
+            if self.solo_channel.as_ref() == Some(&removed.signal_id) {
+                self.solo_channel = None;
+            }
             self.config.channels.remove(&removed.signal_id);
             if self.channels.is_empty() {
                 self.custom_title = false;
@@ -663,6 +685,8 @@ impl Scope {
                 )
             })
             .collect();
+        let torque_scope = !is_comparison && self.is_inverter_torque_scope();
+        let inverter_tiles = torque_scope && self.inverter_tiles;
         let cache_key = ScopeCacheKey {
             start_ms,
             end_ms,
@@ -674,6 +698,7 @@ impl Scope {
             channel_specs,
             data_revision: view.data_revision(),
             configuration: serde_json::to_string(&self.config).unwrap_or_default(),
+            inverter_tiles,
         };
 
         if self.cached_data.as_ref().is_none_or(|c| c.key != cache_key) {
@@ -681,7 +706,11 @@ impl Scope {
             let mut unit_groups: Vec<String> = Vec::new();
             let mut channel_unit_group: Vec<usize> = Vec::with_capacity(self.channels.len());
             for ch in &self.channels {
-                let axis_key = self.config.axis_key(ch);
+                let axis_key = if inverter_tiles {
+                    String::new()
+                } else {
+                    self.config.axis_key(ch)
+                };
                 let pos = unit_groups
                     .iter()
                     .position(|u| u == &axis_key)
@@ -916,8 +945,7 @@ impl Scope {
                 .map(|(index, &(lo, hi))| {
                     if let Some(range) = self
                         .config
-                        .axes
-                        .get(&unit_groups[index])
+                        .axis_config(&unit_groups[index])
                         .and_then(|axis| axis.valid_range())
                     {
                         range
@@ -1019,13 +1047,11 @@ impl Scope {
             }
         }
 
-        // One small toolbar. Signal keys live inline in the toolbar by default (0% plot coverage),
-        // or in the compact floating overlay when toggled on via the legend button.
+        // Each plot uses its header legend or the optional floating overlay.
         let entries = self.build_legend_entries(view, &comparison_annotations, &channel_stats);
         let mut open_picker: Option<ScopePickerTarget> = None;
         let mut clear_all = false;
         let mut export_csv = false;
-        let mut toolbar_action: Option<ui::scope_legend::Action> = None;
 
         eframe::egui::Frame::group(ui.style())
             .inner_margin(eframe::egui::Margin::symmetric(4, 3))
@@ -1035,7 +1061,18 @@ impl Scope {
                     if ui::scope_legend::toggle_button(ui, self.show_legend).clicked() {
                         self.show_legend = !self.show_legend;
                     }
-                    if ui::scope_icons::button(ui, true, self.config.stacked).clicked() {
+                    if torque_scope
+                        && ui.add(ui::scope_icons::toolbar_button(if inverter_tiles { "Overlay" } else { "Tile by inverter" }))
+                            .on_hover_text("Switch between overlaid torque traces and synchronized inverter plots")
+                            .clicked()
+                    {
+                        self.inverter_tiles = !inverter_tiles;
+                        ui.ctx().request_repaint();
+                    }
+                    if self.solo_channel.is_some() && ui.add(ui::scope_icons::toolbar_button("Exit solo")).clicked() {
+                        self.solo_channel = None;
+                    }
+                    if !inverter_tiles && ui::scope_icons::button(ui, true, self.config.stacked).clicked() {
                         self.config.toggle_stack(&self.channels);
                         self.cached_data = None;
                         self.lane_y_overrides.clear();
@@ -1045,14 +1082,14 @@ impl Scope {
                         self.measurements.enabled = !self.measurements.enabled;
                         self.gesture = None;
                     }
-                    if ui.small_button("ƒ").on_hover_text("Channels").clicked() {
+                    if ui.add(ui::scope_icons::toolbar_button("ƒ")).on_hover_text("Channels").clicked() {
                         open_picker = Some(ScopePickerTarget::Channels(
                             0,
                             ui::scope_settings::Destination::Left,
                         ));
                         self.search_query.clear();
                     }
-                    if ui.small_button("+ Plot").clicked() {
+                    if !inverter_tiles && ui.add(ui::scope_icons::toolbar_button("+")).on_hover_text("Add plot").clicked() {
                         self.config.lanes = if self.config.stacked {
                             self.config.lanes.saturating_add(1)
                         } else {
@@ -1072,12 +1109,12 @@ impl Scope {
                         );
                     }
                     if self.x_axis_mode != ScopeXAxisMode::UtcTime
-                        && ui.small_button(self.x_axis_mode.label()).clicked()
+                        && ui.add(ui::scope_icons::toolbar_button(self.x_axis_mode.label())).clicked()
                     {
                         self.x_axis_mode = ScopeXAxisMode::UtcTime;
                     }
 
-                    eframe::egui::containers::menu::MenuButton::new("…")
+                    eframe::egui::containers::menu::MenuButton::from_button(ui::scope_icons::toolbar_button("…"))
                         .config(
                             eframe::egui::containers::menu::MenuConfig::new().close_behavior(
                                 eframe::egui::PopupCloseBehavior::CloseOnClickOutside,
@@ -1185,10 +1222,13 @@ impl Scope {
                                     ui.close();
                                 }
                             });
-                            if self.y_bounds_override.is_some()
-                                && ui.button("Reset Y-Axis Zoom").clicked()
-                            {
-                                self.y_bounds_override = None;
+                            let y_bounds = if inverter_tiles {
+                                &mut self.inverter_y_bounds
+                            } else {
+                                &mut self.y_bounds_override
+                            };
+                            if y_bounds.is_some() && ui.button("Reset Y-Axis Zoom").clicked() {
+                                *y_bounds = None;
                                 ui.close();
                             }
                             if ui.button("Export CSV…").clicked() {
@@ -1202,28 +1242,7 @@ impl Scope {
                             }
                         });
                 });
-                if !self.show_legend && !entries.is_empty() {
-                    toolbar_action = eframe::egui::ScrollArea::horizontal()
-                        .id_salt(("scope_toolbar_keys", self.instance_num))
-                        .min_scrolled_width(0.0)
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui::scope_legend::show_toolbar_strip(
-                                    ui,
-                                    self.instance_num,
-                                    &entries,
-                                    self.show_inline_stats,
-                                )
-                            })
-                            .inner
-                        })
-                        .inner;
-                }
             });
-
-        if let Some(action) = toolbar_action {
-            self.apply_legend_action(action);
-        }
 
         if export_csv {
             view.request_open_export_modal();
@@ -1235,6 +1254,7 @@ impl Scope {
         if clear_all {
             self.channels.clear();
             self.hidden_channels.clear();
+            self.solo_channel = None;
             self.config.channels.clear();
             self.config.axes.clear();
             self.cached_data = None;
@@ -1733,7 +1753,7 @@ mod tests {
         );
         assert!(
             find(&initial, "Channel 19").is_none(),
-            "Overflow is clipped"
+            "Overflow is summarized"
         );
         let toggle = egui::pos2(20.0, 17.0);
         // Click toggle to open the floating legend overlay
@@ -1839,7 +1859,21 @@ mod tests {
         let entry = find(&output, "Channel 0")
             .or_else(|| find(&output, "message.signal_1"))
             .expect("Visible legend row");
-        let output = click(&ctx, &mut scope, &router, entry);
+        frame(&ctx, &mut scope, &router, vec![Event::PointerMoved(entry)]);
+        for pressed in [true, false] {
+            frame(
+                &ctx,
+                &mut scope,
+                &router,
+                vec![Event::PointerButton {
+                    pos: entry,
+                    button: PointerButton::Secondary,
+                    pressed,
+                    modifiers: Modifiers::NONE,
+                }],
+            );
+        }
+        let output = frame(&ctx, &mut scope, &router, vec![]);
         let remove = find(&output, "Remove signal").expect("Channel details popup");
         click(&ctx, &mut scope, &router, remove);
         assert_eq!(scope.channels.len(), 19);

@@ -188,7 +188,9 @@ impl Scope {
         // the scale of signals already assigned at the destination.
         if (existing.is_none() || payload.scope == self.instance_num)
             && destination != Destination::Discrete
-            && payload.axis != ui::scope_settings::AxisConfig::default()
+            && (payload.axis.range.is_some()
+                || payload.axis.color.is_some()
+                || !payload.axis.label.is_empty())
         {
             let side = if destination == Destination::Right {
                 "right"
@@ -236,6 +238,7 @@ impl Scope {
         };
         let mut open = !ctx.input(|input| input.key_pressed(egui::Key::Escape));
         let mut action = ui::message_picker::SignalPickerAction::None;
+        let sides = self.config.resolved_axis_sides(&self.channels);
         let mut remove = None;
         egui::Window::new(if speed { "Speed signal" } else { "Channels" })
             .id(egui::Id::new(("scope_channels", self.instance_num)))
@@ -277,7 +280,14 @@ impl Scope {
                                         {
                                             remove = Some(index);
                                         }
-                                        let mut assigned = self.config.destination(channel);
+                                        let current = if sides.get(&self.config.axis_key(channel))
+                                            == Some(&ui::scope_settings::AxisSide::Right)
+                                        {
+                                            Destination::Right
+                                        } else {
+                                            self.config.destination(channel)
+                                        };
+                                        let mut assigned = current;
                                         egui::ComboBox::from_id_salt("assignment")
                                             .selected_text(assigned.label())
                                             .show_ui(ui, |ui| {
@@ -293,7 +303,7 @@ impl Scope {
                                                     );
                                                 }
                                             });
-                                        if assigned != self.config.destination(channel) {
+                                        if assigned != current {
                                             self.config.assign(channel, lane, assigned);
                                         }
                                         ui.add(egui::Label::new(&channel.signal_id).truncate());

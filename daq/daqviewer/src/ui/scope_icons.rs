@@ -1,7 +1,13 @@
 use eframe::egui::{self, Rect, Stroke};
 
+const BUTTON_SIZE: egui::Vec2 = egui::vec2(24.0, 18.0);
+
+pub(super) fn toolbar_button(label: &str) -> egui::Button<'_> {
+    egui::Button::new(label).small().min_size(BUTTON_SIZE)
+}
+
 pub(super) fn delete_button(ui: &mut egui::Ui, armed: bool) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(24.0, 18.0), egui::Sense::click());
+    let (rect, response) = ui.allocate_exact_size(BUTTON_SIZE, egui::Sense::click());
     let label = if armed {
         "Confirm deletion"
     } else {
@@ -61,12 +67,7 @@ pub(super) fn delete_button(ui: &mut egui::Ui, armed: bool) -> egui::Response {
 
 pub(super) fn button(ui: &mut egui::Ui, stack: bool, selected: bool) -> egui::Response {
     let response = ui
-        .add(
-            egui::Button::new("")
-                .small()
-                .selected(selected)
-                .min_size(egui::vec2(24.0, 18.0)),
-        )
+        .add(toolbar_button("").selected(selected))
         .on_hover_text(if stack {
             "Toggle stacked plots"
         } else {

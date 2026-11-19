@@ -481,8 +481,26 @@ fn single_channels_icon_and_confirmed_plot_deletion() {
         .count();
     assert_eq!(count, 1);
     let delete = h.find("×");
-    assert!((delete.x - h.scope.plot_frames[0].left()).abs() <= 1.0);
-    assert!(h.find("Plot 1").x > delete.x);
+    let button = h
+        .output
+        .as_ref()
+        .unwrap()
+        .shapes
+        .iter()
+        .find_map(|shape| match &shape.shape {
+            egui::Shape::Rect(rect)
+                if rect.rect.contains(delete) && (rect.rect.width() - 23.0).abs() <= 0.1 =>
+            {
+                Some(rect.rect)
+            }
+            _ => None,
+        })
+        .expect("Close button outline");
+    assert!((button.left() - h.scope.plot_frames[0].left()).abs() <= 1.0);
+    let title = h.find("Plot 1");
+    assert!(title.x > delete.x);
+    let first_channel = h.find("Speed");
+    assert!((0.0..75.0).contains(&(first_channel.x - title.x)));
     h.frame(vec![Event::PointerMoved(delete)]);
     assert!(h.output.as_ref().unwrap().shapes.iter().any(|shape| {
         matches!(&shape.shape, egui::Shape::Text(text)
@@ -717,9 +735,10 @@ fn signals_move_across_scopes_from_every_source_and_destination() {
         output
     }
     for reverse in [false, true] {
-        for source_kind in ["left", "right", "discrete", "legend"] {
+        for source_kind in ["left", "right", "discrete", "floating"] {
             for destination in [Destination::Left, Destination::Right, Destination::Discrete] {
                 let mut h = Harness::new(false);
+                h.scope.show_legend = source_kind == "floating";
                 let channel = h.scope.channels[0].clone();
                 let source_destination = match source_kind {
                     "right" => Destination::Right,
@@ -741,11 +760,7 @@ fn signals_move_across_scopes_from_every_source_and_destination() {
                         reverse,
                     ));
                 }
-                let start = h.find(if source_kind == "legend" || source_kind == "discrete" {
-                    "Speed"
-                } else {
-                    SPEED
-                });
+                let start = h.find("Speed");
                 let rect = target.plot_frames[0];
                 let end = match destination {
                     Destination::Left => egui::pos2(rect.left() + 20.0, rect.center().y),
@@ -876,7 +891,7 @@ fn discrete_band_can_be_dragged_back_to_either_axis() {
 fn cancelled_signal_drag_leaves_source_unchanged() {
     let mut h = Harness::new(false);
     let original = h.scope.channels.len();
-    let start = h.find(SPEED);
+    let start = h.find("Speed");
     h.press(start, PointerButton::Primary);
     h.frame(vec![Event::PointerMoved(egui::pos2(500.0, 17.0))]);
     assert!(egui::DragAndDrop::has_any_payload(&h.ctx));
@@ -926,7 +941,9 @@ fn legend_appearance_axis_menus_and_lane_drag_work() {
         h.frame(vec![]);
     }
     let speed = h.find("Speed");
-    h.click(speed);
+    h.press(speed, PointerButton::Secondary);
+    h.release(speed, PointerButton::Secondary);
+    h.frame(vec![]);
     let appearance = h.find("Appearance");
     h.click(appearance);
     let mode = h.find("Solid");
@@ -948,7 +965,9 @@ fn legend_appearance_axis_menus_and_lane_drag_work() {
     egui::Popup::close_all(&h.ctx);
     h.frame(vec![]);
     let speed = h.find("Speed");
-    h.click(speed);
+    h.press(speed, PointerButton::Secondary);
+    h.release(speed, PointerButton::Secondary);
+    h.frame(vec![]);
     let axis = h.find("Axis");
     h.click(axis);
     let fixed = h.find("Fixed");
@@ -990,4 +1009,210 @@ fn legend_appearance_axis_menus_and_lane_drag_work() {
         h.scope.channels[1].color, colors[2],
         "Removing RPM must not recolor Throttle"
     );
+}
+
+#[test]
+fn inverter_tiles_share_torque_axis_and_restore_overlay_layout() {
+    let mut h = Harness::new(false);
+    h.scope = Scope::new_multi(
+        1,
+        "Requested and Actual Torque",
+        ['A', 'B', 'C', 'D']
+            .into_iter()
+            .flat_map(|inverter| {
+                [
+                    (
+                        format!("INV{inverter}_SET.AMK_TorqueSetpoint"),
+                        "AMK_TorqueSetpoint".to_owned(),
+                        "%".to_owned(),
+                    ),
+                    (
+                        format!("INV{inverter}_CRIT.AMK_ActualTorque"),
+                        "AMK_ActualTorque".to_owned(),
+                        "%".to_owned(),
+                    ),
+                ]
+            })
+            .collect(),
+    );
+    for _ in 0..2 {
+        h.frame(vec![]);
+    }
+    assert_eq!(h.scope.plot_frames.len(), 1);
+    let view = workspace_view::WorkspaceDataView::new(&h.router);
+    let entries = h.scope.build_legend_entries(&view, &[], &[]);
+    assert_eq!(entries[0].label, "A Request");
+    assert_eq!(entries[1].label, "A Actual");
+    assert_eq!(entries[0].color, entries[1].color);
+    assert_ne!(entries[0].color, entries[2].color);
+    assert_eq!(entries[0].style, egui_plot::LineStyle::dashed_dense());
+    assert_eq!(entries[1].style, egui_plot::LineStyle::Solid);
+
+    let tile_button = h.find("Tile by inverter");
+    h.click(tile_button);
+    assert_eq!(h.scope.plot_frames.len(), 4);
+    let data = h.scope.cached_data.as_ref().unwrap();
+    assert_eq!(data.unit_groups.len(), 1);
+    assert!(data.mapped_traces.iter().all(|trace| trace.unit_idx == 0));
+    let _ = h.find("Inverter A");
+    let _ = h.find("Inverter B");
+    let overlay_button = h.find("Overlay");
+    h.click(overlay_button);
+    assert_eq!(h.scope.plot_frames.len(), 1);
+    assert!(!h.scope.config.stacked);
+}
+
+#[test]
+fn overflowing_legend_remains_searchable_and_solo_is_reversible() {
+    let mut h = Harness::new(false);
+    h.scope = Scope::new_multi(
+        1,
+        "Overflow",
+        (0..30)
+            .map(|index| {
+                (
+                    format!("message.signal_{index}"),
+                    format!("Signal {index:02}"),
+                    "V".to_owned(),
+                )
+            })
+            .collect(),
+    );
+    h.scope.config.stacked = true;
+    h.scope.config.lanes = 2;
+    for _ in 0..2 {
+        h.frame(vec![]);
+    }
+    let overflow = h
+        .output
+        .as_ref()
+        .unwrap()
+        .shapes
+        .iter()
+        .find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text().ends_with(" more") => {
+                Some(text.pos + text.galley.size() * 0.5)
+            }
+            _ => None,
+        })
+        .expect("Overflow button");
+    let first = h.find("Signal 00");
+    assert!((first.y - overflow.y).abs() < 4.0);
+    h.click(first);
+    h.click(first);
+    assert_eq!(h.scope.solo_channel.as_deref(), Some("message.signal_0"));
+    let exit = h.find("Exit solo");
+    h.click(exit);
+    assert!(h.scope.solo_channel.is_none());
+
+    h.click(overflow);
+    let _ = h.find("Filter channels");
+    assert!(egui::Popup::is_any_open(&h.ctx));
+
+    let filter = h.find("Filter channels");
+    h.click(filter);
+    h.frame(vec![Event::Text("29".to_owned())]);
+    for _ in 0..3 {
+        h.frame(vec![]);
+    }
+    let source = h.find("Signal 29");
+    let target = h.point(1, 0.25);
+    h.press(source, PointerButton::Primary);
+    assert!(egui::Popup::is_any_open(&h.ctx), "Popup hit at {source:?}");
+    h.frame(vec![Event::PointerMoved(target)]);
+    h.frame(vec![Event::PointerMoved(target)]);
+    let payload = egui::DragAndDrop::payload::<ui::scope_legend::SignalDrag>(&h.ctx)
+        .expect("Overflow channel starts a drag");
+    assert_eq!(payload.channel.signal_id, "message.signal_29");
+    assert!(
+        !egui::Popup::is_any_open(&h.ctx),
+        "The list clears the drop target"
+    );
+    h.release(target, PointerButton::Primary);
+    h.frame(vec![]);
+    assert_eq!(h.scope.config.lane("message.signal_29"), 1);
+}
+
+#[test]
+fn same_unit_quantities_have_distinct_axes_and_can_move_as_a_group() {
+    use ui::scope_settings::{AxisConfig, AxisSide};
+
+    let mut h = Harness::new(false);
+    h.scope = Scope::new_multi(
+        1,
+        "Torque and Throttle",
+        [
+            ("INVA_CRIT.AMK_ActualTorque", "Torque A", "%"),
+            ("INVB_CRIT.AMK_ActualTorque", "Torque B", "%"),
+            (THROTTLE, "Throttle", "%"),
+        ]
+        .into_iter()
+        .map(|(signal, label, unit)| (signal.to_owned(), label.to_owned(), unit.to_owned()))
+        .collect(),
+    );
+    let torque = h.scope.config.axis_key(&h.scope.channels[0]);
+    let throttle = h.scope.config.axis_key(&h.scope.channels[2]);
+    assert_eq!(h.scope.config.axis_key(&h.scope.channels[1]), torque);
+    assert_ne!(torque, throttle);
+
+    h.scope.config.axes.insert(
+        "0|%".to_owned(),
+        AxisConfig {
+            range: Some([-100.0, 100.0]),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        h.scope.config.axis_config(&torque).unwrap().range,
+        Some([-100.0, 100.0])
+    );
+    h.scope.config.axes.insert(
+        torque,
+        AxisConfig {
+            side: AxisSide::Right,
+            range: Some([-200.0, 200.0]),
+            ..Default::default()
+        },
+    );
+    let sides = h.scope.config.resolved_axis_sides(&h.scope.channels);
+    assert_eq!(sides[&throttle], AxisSide::Left);
+
+    h.scope.add_channel(
+        RPM.to_owned(),
+        "RPM".to_owned(),
+        "rpm".to_owned(),
+        None,
+        false,
+    );
+    for _ in 0..4 {
+        h.frame(vec![]);
+    }
+    let output = h.output.as_ref().unwrap();
+    for unit in ["%", "rpm"] {
+        let prefix = format!("{unit}\n");
+        assert!(output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text) if text.angle == 0.0
+                && text.galley.rows.len() == 2
+                && text.galley.text().strip_prefix(&prefix).is_some_and(|value| value.parse::<f64>().is_ok()))
+        }), "Missing a unit above the tick value for {unit}");
+    }
+    assert!(!output.shapes.iter().any(|shape| {
+        matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == "Torque (%)")
+    }));
+
+    let entry = h.find("Torque A");
+    h.press(entry, PointerButton::Secondary);
+    h.release(entry, PointerButton::Secondary);
+    h.frame(vec![]);
+    let _ = h.find("Right · Torque (%)");
+    let move_axis = h.find("Move axis to linked plot");
+    h.click(move_axis);
+    assert_eq!(h.scope.config.lane("INVA_CRIT.AMK_ActualTorque"), 1);
+    assert_eq!(h.scope.config.lane("INVB_CRIT.AMK_ActualTorque"), 1);
+    assert_eq!(h.scope.config.lane(THROTTLE), 0);
+    assert_eq!(h.scope.plot_frames.len(), 2);
+    let new_key = h.scope.config.axis_key(&h.scope.channels[0]);
+    let axis = h.scope.config.axis_config(&new_key).unwrap();
+    assert_eq!(axis.side, AxisSide::Right);
+    assert_eq!(axis.range, Some([-200.0, 200.0]));
 }

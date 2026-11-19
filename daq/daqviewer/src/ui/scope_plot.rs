@@ -7,9 +7,9 @@ struct AxisView {
     index: usize,
     lane: usize,
     right: bool,
-    custom_label: String,
-    unit: String,
-    color: Color32,
+    label: String,
+    tick_unit: String,
+    color: Option<Color32>,
 }
 
 /// Scale trace stroke thickness as a function of plot dimensions (`plot_width`, `plot_height`)
@@ -36,50 +36,73 @@ pub(super) fn adaptive_trace_width(
     (base_width * size_scale * zoom_scale).clamp(base_width, 4.5)
 }
 
+fn axis_label(quantity: Option<&str>, unit: &str, custom_label: &str) -> String {
+    let unit = if unit.trim().is_empty() {
+        "unit unknown"
+    } else {
+        unit
+    };
+    let name = if custom_label.is_empty() {
+        quantity
+    } else {
+        Some(custom_label)
+    };
+    match name {
+        None => unit.to_owned(),
+        Some(name)
+            if name == unit
+                || name.ends_with(&format!("({unit})"))
+                || name.ends_with(&format!("[{unit}]")) =>
+        {
+            name.to_owned()
+        }
+        Some(name) => format!("{name} ({unit})"),
+    }
+}
+
 fn axes(
     cached: &CachedScopeData,
     config: &ScopeConfig,
     channels: &[ScopeChannel],
 ) -> Vec<AxisView> {
-    let mut counts = std::collections::BTreeMap::<usize, usize>::new();
+    let sides = config.resolved_axis_sides(channels);
     cached
         .unit_groups
         .iter()
         .enumerate()
-        .filter(|(_, key)| {
-            channels
-                .iter()
-                .any(|ch| config.axis_key(ch) == **key && !config.style(&ch.signal_id).discrete)
-        })
-        .map(|(index, key)| {
-            let lane = ScopeConfig::axis_lane(key);
-            let order = counts.entry(lane).or_default();
-            let axis = config.axes.get(key).cloned().unwrap_or_default();
-            let channel = channels
-                .iter()
-                .find(|channel| config.axis_key(channel) == *key);
-            let unit = channel
-                .map(|channel| channel.unit.clone())
-                .unwrap_or_default();
-            let color = axis
-                .color
-                .map(|[r, g, b]| Color32::from_rgb(r, g, b))
-                .or_else(|| channel.map(|channel| channel.color))
-                .unwrap_or(Color32::GRAY);
-            let right = match axis.side {
-                AxisSide::Auto => *order % 2 == 1,
-                AxisSide::Left => false,
-                AxisSide::Right => true,
-            };
-            *order += 1;
-            AxisView {
-                index,
-                lane,
-                right,
-                custom_label: axis.label,
-                unit,
-                color,
+        .filter_map(|(index, key)| {
+            let side = sides.get(key)?;
+            let mut members = channels.iter().filter(|channel| {
+                !config.style(&channel.signal_id).discrete && config.axis_key(channel) == *key
+            });
+            let first = members.next()?;
+            let mut quantity = ui::scope_settings::axis_quantity(&first.signal_id);
+            let mut unit = first.unit.as_str();
+            for member in members {
+                if ui::scope_settings::axis_quantity(&member.signal_id) != quantity {
+                    quantity = None;
+                }
+                if member.unit != unit {
+                    unit = "mixed units";
+                }
             }
+            let config = config.axis_config(key);
+            let custom_label = config.map_or("", |axis| axis.label.as_str());
+            let color = config
+                .and_then(|axis| axis.color)
+                .map(|[r, g, b]| Color32::from_rgb(r, g, b));
+            Some(AxisView {
+                index,
+                lane: ScopeConfig::axis_lane(key),
+                right: *side == AxisSide::Right,
+                label: axis_label(quantity, unit, custom_label),
+                tick_unit: if unit == "mixed units" {
+                    String::new()
+                } else {
+                    unit.trim().to_owned()
+                },
+                color,
+            })
         })
         .collect()
 }
@@ -104,28 +127,27 @@ fn hints(
             } else {
                 egui_plot::HPlacement::Left
             };
-            let mut hint = egui_plot::AxisHints::new_y()
+            let hint = egui_plot::AxisHints::new_y()
                 .placement(placement)
                 .min_thickness(min_thick);
             result.push(if let Some(axis) = selected.get(slot) {
                 let tf = cached.unit_transforms[axis.index];
-                let unit_suffix = axis.unit.clone();
-                if !axis.custom_label.is_empty() {
-                    hint = hint.label(
-                        RichText::new(axis.custom_label.chars().take(18).collect::<String>())
-                            .color(axis.color),
-                    );
-                }
+                let unit = axis.tick_unit.clone();
+                let hint = if unit.is_empty() {
+                    hint
+                } else {
+                    hint.label_spacing(28.0..=40.0)
+                };
                 hint.formatter(move |mark, _| {
                     let value = tf.plot_to_phys(mark.value);
                     let step = (mark.step_size / tf.scale.abs().max(1e-9)).max(1e-6);
                     let decimals = (-step.log10().floor() as isize).clamp(0, 3) as usize;
-                    let num_str =
+                    let number =
                         egui::emath::format_with_decimals_in_range(value, decimals..=decimals);
-                    if unit_suffix.is_empty() {
-                        num_str
+                    if unit.is_empty() {
+                        number
                     } else {
-                        format!("{num_str} {unit_suffix}")
+                        format!("{unit}\n{number}")
                     }
                 })
             } else {
@@ -136,7 +158,87 @@ fn hints(
     result
 }
 
+fn focus_opacity(focused: Option<usize>, channel_index: usize) -> f32 {
+    if focused.is_some_and(|index| index != channel_index) {
+        0.22
+    } else {
+        1.0
+    }
+}
+
+fn inverter_torque(signal: &str) -> Option<(usize, bool)> {
+    let (message, field) = signal.split_once('.')?;
+    let (inverter, message_kind) = message.strip_prefix("INV")?.split_once('_')?;
+    let lane = match inverter {
+        "A" => 0,
+        "B" => 1,
+        "C" => 2,
+        "D" => 3,
+        _ => return None,
+    };
+    match (message_kind, field) {
+        ("SET", "AMK_TorqueSetpoint") => Some((lane, true)),
+        ("CRIT", "AMK_ActualTorque") => Some((lane, false)),
+        _ => None,
+    }
+}
+
+fn inverter_name(lane: usize) -> char {
+    ['A', 'B', 'C', 'D'][lane]
+}
+
+fn plot_lane(config: &ScopeConfig, signal: &str, inverter_tiles: bool) -> usize {
+    if inverter_tiles {
+        inverter_torque(signal).map_or(0, |(lane, _)| lane)
+    } else {
+        config.lane(signal)
+    }
+}
+
+fn trace_appearance(
+    trace: &PreparedTrace,
+    channel: &ScopeChannel,
+    style: &ui::scope_settings::SignalStyle,
+    torque_scope: bool,
+) -> (Color32, egui_plot::LineStyle) {
+    if torque_scope && let Some((lane, requested)) = inverter_torque(&channel.signal_id) {
+        let line_style = if requested {
+            egui_plot::LineStyle::dashed_dense()
+        } else {
+            egui_plot::LineStyle::Solid
+        };
+        return (CHANNEL_PALETTE[lane], line_style);
+    }
+    (trace.color, style.mode.line_style(trace.style))
+}
+
 impl Scope {
+    pub(super) fn is_inverter_torque_scope(&self) -> bool {
+        let Some(first) = self.channels.first() else {
+            return false;
+        };
+        let mut requested = false;
+        let mut actual = false;
+        for channel in &self.channels {
+            let Some((_, is_requested)) = inverter_torque(&channel.signal_id) else {
+                return false;
+            };
+            if channel.unit != first.unit || self.config.style(&channel.signal_id).discrete {
+                return false;
+            }
+            requested |= is_requested;
+            actual |= !is_requested;
+        }
+        requested && actual
+    }
+
+    fn channel_is_visible(&self, channel: &ScopeChannel) -> bool {
+        self.solo_channel.as_ref().map_or_else(
+            || !self.hidden_channels.contains(&channel.signal_id),
+            |solo| solo == &channel.signal_id,
+        )
+    }
+
     pub(super) fn build_legend_entries(
         &self,
         view: &workspace_view::WorkspaceDataView<'_>,
@@ -147,6 +249,7 @@ impl Scope {
             return Vec::new();
         };
         let is_comparison = comparison.len() >= 2;
+        let torque_scope = !is_comparison && self.is_inverter_torque_scope();
         let x_mode = self.x_axis_mode;
         let start_ms = view.timeline.start_utc_ms();
         let reference_ms = if is_comparison {
@@ -198,16 +301,34 @@ impl Scope {
                     return None;
                 }
                 let pair = measurement_pair(index);
+                let (color, line_style) = trace_appearance(trace, channel, &style, torque_scope);
+                let short = ui::scope_legend::short_label(channel);
+                let unique_label = if torque_scope
+                    && let Some((lane, requested)) = inverter_torque(&channel.signal_id)
+                {
+                    let kind = if requested { "Request" } else { "Actual" };
+                    if cached.key.inverter_tiles {
+                        kind.to_owned()
+                    } else {
+                        format!("{} {kind}", inverter_name(lane))
+                    }
+                } else if self.channels.iter().any(|other| {
+                    other.signal_id != channel.signal_id
+                        && ui::scope_legend::short_label(other) == short
+                }) {
+                    channel.signal_id.clone()
+                } else {
+                    short.to_owned()
+                };
                 let label = if is_comparison {
                     format!(
-                        "{} ({})",
-                        ui::scope_legend::short_label(channel),
+                        "{unique_label} ({})",
                         comparison[index % traces_per_channel].name
                     )
                 } else if channel.is_derived {
-                    format!("ƒ {}", ui::scope_legend::short_label(channel))
+                    format!("ƒ {unique_label}")
                 } else {
-                    ui::scope_legend::short_label(channel).to_owned()
+                    unique_label
                 };
                 let value = if let Some((a, b)) = pair {
                     Some(format!("Δ ({:.3} {})", b - a, channel.unit))
@@ -230,10 +351,14 @@ impl Scope {
                     label,
                     signal_id: channel.signal_id.clone(),
                     value,
-                    color: trace.color,
-                    style: style.mode.line_style(trace.style),
+                    color,
+                    style: line_style,
                     stats: if is_comparison { None } else { stats },
-                    visible: !self.hidden_channels.contains(&channel.signal_id),
+                    visible: self.channel_is_visible(channel),
+                    destination: None,
+                    axis_label: String::new(),
+                    axis_color: None,
+                    can_move_axis: false,
                     measurements: pair,
                     drag: Some(ui::scope_legend::SignalDrag::new(
                         self.instance_num,
@@ -248,13 +373,56 @@ impl Scope {
     pub(super) fn apply_legend_action(&mut self, action: ui::scope_legend::Action) {
         match action {
             ui::scope_legend::Action::Remove(index) => self.remove_channel(index),
-            ui::scope_legend::Action::Toggle(index) => self.toggle_channel_visibility(index),
+            ui::scope_legend::Action::Toggle(index) => {
+                self.solo_channel = None;
+                self.toggle_channel_visibility(index);
+            }
+            ui::scope_legend::Action::Solo(index) => {
+                if let Some(channel) = self.channels.get(index) {
+                    let signal = &channel.signal_id;
+                    self.solo_channel =
+                        (self.solo_channel.as_ref() != Some(signal)).then(|| signal.clone());
+                }
+            }
+            ui::scope_legend::Action::MoveAxis(index) => self.move_axis_to_linked_plot(index),
             ui::scope_legend::Action::Inspect(index, tab) => {
                 if let Some(channel) = self.channels.get(index) {
                     self.inspector = Some((channel.signal_id.clone(), tab));
                 }
             }
         }
+    }
+
+    fn move_axis_to_linked_plot(&mut self, index: usize) {
+        let Some(channel) = self.channels.get(index) else {
+            return;
+        };
+        let origin = self.config.axis_key(channel);
+        let lane = if self.config.stacked {
+            self.config.lanes
+        } else {
+            1
+        };
+        let axis = self.config.axis_config(&origin).cloned();
+        for channel in &self.channels {
+            let current_lane = self.config.lane(&channel.signal_id);
+            let move_channel = self.config.axis_key(channel) == origin
+                && !self.config.style(&channel.signal_id).discrete;
+            let style = self
+                .config
+                .channels
+                .entry(channel.signal_id.clone())
+                .or_default();
+            style.lane = if move_channel { lane } else { current_lane };
+        }
+        self.config.stacked = true;
+        self.config.lanes = lane + 1;
+        if let Some(axis) = axis {
+            self.config
+                .axes
+                .insert(self.config.axis_key(&self.channels[index]), axis);
+        }
+        self.cached_data = None;
     }
 
     pub(super) fn render_plots(
@@ -267,7 +435,13 @@ impl Scope {
         let Some(cached) = self.cached_data.as_ref() else {
             return egui_tiles::UiResponse::None;
         };
+        let visible: Vec<_> = self
+            .channels
+            .iter()
+            .map(|ch| self.channel_is_visible(ch))
+            .collect();
         let is_comparison = comparison.len() >= 2;
+        let torque_scope = !is_comparison && self.is_inverter_torque_scope();
         let x_mode = self.x_axis_mode;
         let start_ms = view.timeline.start_utc_ms();
         let end_ms = view.timeline.end_utc_ms();
@@ -296,12 +470,28 @@ impl Scope {
                 _ => Some((time - reference_ms) as f64 / 1000.0),
             };
         let traces_per_channel = if is_comparison { comparison.len() } else { 1 };
-        let lane_count = if self.config.stacked {
+        let inverter_tiles = cached.key.inverter_tiles;
+        let lane_count = if inverter_tiles {
+            4
+        } else if self.config.stacked {
             self.config.lanes
         } else {
             1
         };
-        let axis_views = axes(cached, &self.config, &self.channels);
+        let axis_views = if inverter_tiles {
+            (0..lane_count)
+                .map(|lane| AxisView {
+                    index: 0,
+                    lane,
+                    right: false,
+                    label: axis_label(Some("Torque"), &self.channels[0].unit, ""),
+                    tick_unit: self.channels[0].unit.trim().to_owned(),
+                    color: None,
+                })
+                .collect()
+        } else {
+            axes(cached, &self.config, &self.channels)
+        };
         let slots = (0..lane_count).fold((0usize, 0usize), |(left, right), lane| {
             (
                 left.max(
@@ -320,7 +510,7 @@ impl Scope {
         });
         let slots = if slots == (0, 0) { (1, 0) } else { slots };
         let height = ((ui.available_height() - (lane_count - 1) as f32 * 4.0) / lane_count as f32
-            - 44.0)
+            - 29.0)
             .max(160.0);
         let mut actions = Vec::new();
         let mut move_signal = None;
@@ -339,56 +529,72 @@ impl Scope {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for lane in 0..lane_count {
-                    ui.horizontal(|ui| {
-                        let plot_left = previous_frames.get(lane).map_or(
-                            ui.next_widget_position().x + slots.0 as f32 * 64.0,
-                            |frame| frame.left(),
-                        );
-                        ui.add_space((plot_left - ui.next_widget_position().x - 12.0).max(0.0));
-                        if ui::scope_icons::delete_button(ui, pending_delete == Some(lane)).clicked() {
-                            delete_clicked = true;
-                            if pending_delete == Some(lane) {
-                                delete_plot = Some(lane);
-                                pending_delete = None;
-                            } else {
-                                pending_delete = Some(lane);
-                            }
-                        }
-                        ui.add(egui::TextEdit::singleline(self.config.plot_names.entry(lane).or_default())
-                            .hint_text(format!("Plot {}", lane + 1))
-                            .desired_width(ui.available_width()).frame(false));
-                    });
-                    ui.columns(2, |columns| {
-                        for (side, column) in columns.iter_mut().enumerate() {
-                            let right = side == 1;
-                            egui::ScrollArea::horizontal()
-                                .id_salt(("scope_axis_signals", self.instance_num, lane, side))
-                                .min_scrolled_width(0.0)
-                                .show(column, |ui| ui.horizontal(|ui| {
-                                for channel in &self.channels {
-                                    if self.config.lane(&channel.signal_id) != lane
-                                        || self.config.style(&channel.signal_id).discrete { continue; }
-                                    let key = self.config.axis_key(channel);
-                                    let channel_right = axis_views.iter().find(|axis| cached.unit_groups[axis.index] == key)
-                                        .is_some_and(|axis| axis.right);
-                                    if channel_right != right { continue; }
-                                    ui.add(egui::Label::new(egui::RichText::new(&channel.signal_id).small().color(channel.color))
-                                        .truncate().sense(egui::Sense::drag()))
-                                        .dnd_set_drag_payload(ui::scope_legend::SignalDrag::new(self.instance_num, channel, &self.config));
-                                }
-                            }));
-                        }
-                    });
+                    let lane_axes: Vec<_> = axis_views.iter().filter(|axis| axis.lane == lane).collect();
                     let legend_entries: Vec<_> = entries
                         .iter()
-                        .filter(|entry| self.config.lane(&entry.signal_id) == lane)
+                        .filter(|entry| plot_lane(&self.config, &entry.signal_id, inverter_tiles) == lane)
                         .cloned()
+                        .map(|mut entry| {
+                            let channel = &self.channels[entry.channel_index];
+                            let key = self.config.axis_key(channel);
+                            let axis = lane_axes.iter().find(|axis| {
+                                inverter_tiles || cached.unit_groups[axis.index] == key
+                            });
+                            if let Some(axis) = axis {
+                                entry.destination = Some(if axis.right { Destination::Right } else { Destination::Left });
+                                entry.axis_label = axis.label.clone();
+                                entry.axis_color = axis.color;
+                                entry.can_move_axis = !inverter_tiles && lane_axes.len() > 2;
+                            }
+                            entry
+                        })
                         .collect();
                     let legend_instance = if lane_count == 1 {
                         self.instance_num
                     } else {
                         egui::Id::new(("scope_lane_legend", self.instance_num, lane)).value() as usize
                     };
+                    ui.horizontal(|ui| {
+                        let header_left = ui.next_widget_position().x;
+                        let plot_left = previous_frames
+                            .get(lane)
+                            .map_or(header_left + slots.0 as f32 * 64.0, |frame| frame.left());
+                        ui.add_space((plot_left - header_left).max(0.0));
+                        if inverter_tiles {
+                            ui.strong(format!("Inverter {}", inverter_name(lane)));
+                        } else {
+                            if ui::scope_icons::delete_button(ui, pending_delete == Some(lane)).clicked() {
+                                delete_clicked = true;
+                                if pending_delete == Some(lane) {
+                                    delete_plot = Some(lane);
+                                    pending_delete = None;
+                                } else {
+                                    pending_delete = Some(lane);
+                                }
+                            }
+                            let hint = format!("Plot {}", lane + 1);
+                            let name = self.config.plot_names.entry(lane).or_default();
+                            let title = if name.is_empty() { hint.as_str() } else { name.as_str() };
+                            let text_width = ui.painter().layout_no_wrap(
+                                title.to_owned(),
+                                egui::TextStyle::Body.resolve(ui.style()),
+                                ui.visuals().text_color(),
+                            ).size().x;
+                            let title_width = (text_width + 8.0).min((ui.available_width() * 0.25).clamp(46.0, 140.0));
+                            ui.add(egui::TextEdit::singleline(name)
+                                .hint_text(hint)
+                                .desired_width(title_width)
+                                .frame(false));
+                        }
+                        if !self.show_legend
+                            && let Some(action) = ui::scope_legend::show_toolbar_strip(
+                                ui, legend_instance, &legend_entries, self.show_inline_stats,
+                            )
+                        {
+                            actions.push(action);
+                        }
+                    });
+                    let focused = ui::scope_legend::hovered_channel(ui.ctx(), legend_instance);
                     let plot_id = (
                         "scope_plot_v3",
                         self.instance_num,
@@ -396,17 +602,15 @@ impl Scope {
                         is_comparison,
                         x_mode as u8,
                     );
-                    let (active_min, active_max) = if lane_count == 1 {
-                        self.y_bounds_override
-                    } else {
-                        self.lane_y_overrides.get(&lane).copied()
-                    }
-                    .unwrap_or((cached.primary_min, cached.primary_max));
-                    let mut next_y_override = if lane_count == 1 {
+                    let mut next_y_override = if inverter_tiles {
+                        self.inverter_y_bounds
+                    } else if lane_count == 1 {
                         self.y_bounds_override
                     } else {
                         self.lane_y_overrides.get(&lane).copied()
                     };
+                    let (active_min, active_max) =
+                        next_y_override.unwrap_or((cached.primary_min, cached.primary_max));
                     let discrete_count = self.channels.iter().filter(|ch| {
                         self.config.lane(&ch.signal_id) == lane && self.config.style(&ch.signal_id).discrete
                     }).count();
@@ -444,16 +648,17 @@ impl Scope {
                             let Some(channel) = self.channels.get(channel_index) else {
                                 continue;
                             };
-                            if self.config.lane(&channel.signal_id) != lane
+                            if plot_lane(&self.config, &channel.signal_id, inverter_tiles) != lane
                                 || self.config.style(&channel.signal_id).discrete
-                                || self.hidden_channels.contains(&channel.signal_id)
+                                || !visible[channel_index]
                             {
                                 continue;
                             }
                             let style = self.config.style(&channel.signal_id);
                             let effective_width =
                                 adaptive_trace_width(style.width, plot_width, plot_height, window_s);
-                            let color = trace.color.gamma_multiply(style.opacity);
+                            let (base_color, line_style) = trace_appearance(trace, channel, &style, torque_scope);
+                            let color = base_color.gamma_multiply(style.opacity * focus_opacity(focused, channel_index));
                             if style.mode != TraceMode::Points {
                                 let points = if style.mode == TraceMode::Steps {
                                     ui::scope_settings::steps(&trace.mean_points)
@@ -464,7 +669,7 @@ impl Scope {
                                     egui_plot::Line::new(trace.name.clone(), points)
                                         .color(color)
                                         .width(effective_width)
-                                        .style(style.mode.line_style(trace.style)),
+                                        .style(line_style),
                                 );
                             }
                             if style.points || style.mode == TraceMode::Points {
@@ -650,8 +855,8 @@ impl Scope {
                             let Some(channel) = self.channels.get(channel_index) else {
                                 continue;
                             };
-                            if self.config.lane(&channel.signal_id) != lane
-                                || self.hidden_channels.contains(&channel.signal_id)
+                            if plot_lane(&self.config, &channel.signal_id, inverter_tiles) != lane
+                                || !visible[channel_index]
                             {
                                 continue;
                             }
@@ -663,7 +868,8 @@ impl Scope {
                             {
                                 continue;
                             }
-                            let fill_color = trace.color.gamma_multiply(style.opacity * 0.22);
+                            let (color, _) = trace_appearance(trace, channel, &style, torque_scope);
+                            let fill_color = color.gamma_multiply(style.opacity * 0.22 * focus_opacity(focused, channel_index));
                             for quad in &trace.envelope_bands {
                                 let base = envelope_mesh.vertices.len() as u32;
                                 for pt in quad {
@@ -694,7 +900,7 @@ impl Scope {
                         && sel_end_ms > sel_start_ms
                     {
                         Self::draw_selection_stats_overlay(
-                            (&self.channels, &self.config, &self.hidden_channels),
+                            (&self.channels, &self.config, &visible),
                             ui,
                             *response.transform.frame(),
                             cached,
@@ -703,6 +909,7 @@ impl Scope {
                             sel_start_ms,
                             sel_end_ms,
                             &to_x,
+                            inverter_tiles,
                         );
                     }
                     let frame = *response.transform.frame();
@@ -723,7 +930,7 @@ impl Scope {
                     });
                     let browser_payload = egui::DragAndDrop::payload::<ui::signal_browser::DraggedSignal>(ui.ctx());
                     let legend_payload = egui::DragAndDrop::payload::<ui::scope_legend::SignalDrag>(ui.ctx());
-                    if browser_payload.is_some() || legend_payload.is_some() {
+                    if !inverter_tiles && (browser_payload.is_some() || legend_payload.is_some()) {
                         for (rect, dest) in zones {
                             let active = destination == Some(dest);
                             ui.painter().rect_filled(rect, 2.0, Color32::LIGHT_BLUE.gamma_multiply(if active { 0.18 } else { 0.06 }));
@@ -749,7 +956,12 @@ impl Scope {
                             }
                         }
                     }
-                    if lane_count == 1 {
+                    if inverter_tiles {
+                        if self.inverter_y_bounds != next_y_override {
+                            self.inverter_y_bounds = next_y_override;
+                            ui.ctx().request_repaint();
+                        }
+                    } else if lane_count == 1 {
                         self.y_bounds_override = next_y_override;
                     } else if let Some(range) = next_y_override {
                         self.lane_y_overrides.insert(lane, range);
@@ -820,11 +1032,7 @@ impl Scope {
 
     #[allow(clippy::too_many_arguments)]
     fn draw_selection_stats_overlay(
-        (channels, config, hidden_channels): (
-            &[ScopeChannel],
-            &ui::scope_settings::ScopeConfig,
-            &std::collections::HashSet<String>,
-        ),
+        (channels, config, visible): (&[ScopeChannel], &ui::scope_settings::ScopeConfig, &[bool]),
         ui: &mut egui::Ui,
         frame: egui::Rect,
         cached: &CachedScopeData,
@@ -833,6 +1041,7 @@ impl Scope {
         sel_start_ms: i64,
         sel_end_ms: i64,
         to_x: &impl Fn(i64) -> Option<f64>,
+        inverter_tiles: bool,
     ) {
         let mut rows: Vec<(String, Color32, String, SectionStats)> = Vec::new();
         let (x0, x1) = match (to_x(sel_start_ms), to_x(sel_end_ms)) {
@@ -841,9 +1050,7 @@ impl Scope {
         };
 
         for (ch_idx, channel) in channels.iter().enumerate() {
-            if config.lane(&channel.signal_id) != lane
-                || hidden_channels.contains(&channel.signal_id)
-            {
+            if plot_lane(config, &channel.signal_id, inverter_tiles) != lane || !visible[ch_idx] {
                 continue;
             }
             let stats = cached

@@ -7,6 +7,13 @@ pub struct FrameDecoder {
 }
 
 impl FrameDecoder {
+    pub fn from_selection(selection: can_thread::DatabaseSelection) -> Self {
+        Self {
+            database: Some(selection.database),
+            selection: selection.selection,
+        }
+    }
+
     /// Load and validate file replacements on the worker
     /// Failures leave both the definitions and bus selection unchanged.
     pub fn select(

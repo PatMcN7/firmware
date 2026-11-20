@@ -37,6 +37,12 @@ DaqApp is PER's complete trackside data acquisition and analysis desktop applica
 
 Sidebar settings (source, SuperDBC, etc) are saved to a local settings file to persist between sessions.
 
+## BeamNG telemetry
+
+Install and enable the `daqapp_telemetry.zip` mod. In a map with a spawned vehicle, run `extensions.load('daqApp')` in BeamNG's **GE Lua** console. In desktop DAQApp, open **Settings → Source → BeamNG (localhost:4445)**. The receiver binds to localhost and loads the BeamNG signal definitions automatically. Use **Channels** or add a **Scope** to plot signals such as `speed_mps` and `rpm`.
+
+If you change the port in DAQApp, also run `extensions.daqApp.configure(port, 30)` with the matching numeric port in BeamNG. When logging is enabled, BeamNG raw logs go into the `beamng` subfolder of the selected log folder. Export the matching SuperDBC for those logs with `cargo run --manifest-path daq/Cargo.toml -p daqcore --example beamng_decode --locked -- --database` from the repository root.
+
 ## Scope graphs
 
 - New scopes start as blank plots. Click a plot title to rename it; names are saved with the workspace.

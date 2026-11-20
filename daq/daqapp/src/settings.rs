@@ -15,6 +15,10 @@ pub fn database_dir() -> Option<path::PathBuf> {
 }
 
 const DEFAULT_UDP_PORT: u16 = 5005;
+
+fn default_beamng_port() -> u16 {
+    daqcore::beamng::DEFAULT_PORT
+}
 const DEFAULT_CAN_SPEED: daqnative::connection::CanBusSpeed =
     daqnative::connection::CanBusSpeed::Kbps500;
 
@@ -25,6 +29,8 @@ pub struct Settings {
     pub selected_source: Option<daqnative::connection::ConnectionSource>,
     pub selected_speed: daqnative::connection::CanBusSpeed,
     pub udp_port: u16,
+    #[serde(default = "default_beamng_port")]
+    pub beamng_port: u16,
     pub theme: ui::theme::ThemeSelection,
     pub pixels_per_point: Option<f32>,
     pub log_folder: Option<path::PathBuf>,
@@ -45,6 +51,7 @@ impl Default for Settings {
             selected_source: None,
             selected_speed: DEFAULT_CAN_SPEED,
             udp_port: DEFAULT_UDP_PORT,
+            beamng_port: default_beamng_port(),
             theme: ui::theme::ThemeSelection::default(),
             pixels_per_point: None,
             log_folder: None,

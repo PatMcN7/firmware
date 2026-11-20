@@ -2,6 +2,7 @@ use crate::{
     action, paths, settings, ui, util, widget_constructor, widget_ids, widgets, workspace_io,
     workspace_view,
 };
+use daqnative::connection::ConnectionSource;
 use std::{any::Any, error, ops::RangeInclusive, path, sync::mpsc};
 
 pub use daqviewer::{
@@ -130,23 +131,33 @@ pub struct DesktopPlatform {
     pub selection_request: u64,
     pub can_bus_speed: daqnative::connection::CanBusSpeed,
     pub udp_port: u16,
+    beamng_port: u16,
+    hardware_database: Option<DatabaseSelection>,
     pub hil_snapshot: daqnative::hil::engine::HilSnapshot,
     pub active_source: Option<daqnative::connection::ConnectionSource>,
     pub settings_dirty_since: Option<std::time::Instant>,
 }
 
 impl DesktopPlatform {
+    fn hardware_database<'a>(&'a self, state: &'a ViewerState) -> Option<&'a DatabaseSelection> {
+        if matches!(self.active_source, Some(ConnectionSource::BeamNg(_))) {
+            self.hardware_database.as_ref()
+        } else {
+            state.database.as_ref()
+        }
+    }
+
     pub fn build_settings(&self, state: &ViewerState) -> settings::Settings {
+        let hardware_database = self.hardware_database(state);
         settings::Settings {
-            superdbc_path: state
-                .database
-                .as_ref()
-                .and_then(|selection| selection.source())
+            superdbc_path: hardware_database
+                .and_then(DatabaseSelection::source)
                 .map(|source| source.path),
-            bus_selection: state.database.as_ref().map(|selection| selection.selection),
+            bus_selection: hardware_database.map(|selection| selection.selection),
             selected_source: self.selected_source.clone(),
             selected_speed: self.can_bus_speed,
             udp_port: self.udp_port,
+            beamng_port: self.beamng_port,
             theme: state.theme_selection,
             pixels_per_point: state.pixels_per_point,
             log_folder: state.log_folder.clone(),
@@ -175,13 +186,14 @@ impl DesktopPlatform {
         path: &path::Path,
         preferred_selection: Option<daqnative::can_thread::BusSelection>,
     ) {
-        let preferred_selection = if !self.supports_multi_bus()
-            && preferred_selection.is_none_or(|selection| selection.is_multi_bus())
-        {
-            Some(daqnative::can_thread::BusSelection::Single(0))
-        } else {
-            preferred_selection
-        };
+        let preferred_selection =
+            if matches!(self.selected_source, Some(ConnectionSource::Serial(..)))
+                && preferred_selection.is_none_or(|selection| selection.is_multi_bus())
+            {
+                Some(daqnative::can_thread::BusSelection::Single(0))
+            } else {
+                preferred_selection
+            };
         self.request_selection(
             state,
             daqnative::can_thread::DatabaseRequest::Load {
@@ -196,7 +208,7 @@ impl DesktopPlatform {
         state: &mut ViewerState,
         new_selection: daqnative::can_thread::BusSelection,
     ) {
-        let Some(selection) = &state.database else {
+        let Some(selection) = self.hardware_database(state) else {
             return;
         };
         if selection.selection == new_selection {
@@ -218,8 +230,8 @@ impl DesktopPlatform {
     }
 
     pub fn enforce_single_bus_if_needed(&mut self, state: &mut ViewerState) {
-        if !self.supports_multi_bus()
-            && let Some(db) = &state.database
+        if matches!(self.selected_source, Some(ConnectionSource::Serial(..)))
+            && let Some(db) = self.hardware_database(state)
             && db.selection.is_multi_bus()
             && let Some(fallback) =
                 daqnative::can_thread::BusSelection::default_single(&db.database)
@@ -262,18 +274,24 @@ impl DesktopPlatform {
         }
         self.pending_database = None;
         state.selection_pending = false;
+        let beamng_active = matches!(self.active_source, Some(ConnectionSource::BeamNg(_)));
+        let database_target = if beamng_active {
+            &mut self.hardware_database
+        } else {
+            &mut state.database
+        };
         match result {
             Ok(daqnative::can_thread::DatabaseUpdate::Loaded {
                 database,
                 selection,
             }) => {
-                state.database = Some(DatabaseSelection {
+                *database_target = Some(DatabaseSelection {
                     database: *database,
                     selection,
                 });
             }
             Ok(daqnative::can_thread::DatabaseUpdate::Bus { selection }) => {
-                let Some(db_selection) = &mut state.database else {
+                let Some(db_selection) = database_target else {
                     state.diagnostic = Some("No UI database is loaded".to_owned());
                     return false;
                 };
@@ -283,6 +301,9 @@ impl DesktopPlatform {
                 state.diagnostic = Some(error);
                 return false;
             }
+        }
+        if beamng_active {
+            return true;
         }
         if state.connection_status == ConnectionStatus::Connected
             || (state.router.partitions().is_empty() && state.router.timeline().is_live())
@@ -294,13 +315,42 @@ impl DesktopPlatform {
         state.bus_load_samples.clear();
         self.hil_snapshot = daqnative::hil::engine::HilSnapshot::idle();
         state.diagnostic = None;
+        Self::reset_database_widgets(state);
+        self.enforce_single_bus_if_needed(state);
+        true
+    }
+
+    fn reset_database_widgets(state: &mut ViewerState) {
         for tile in state.tile_tree.tiles.tiles_mut() {
             if let egui_tiles::Tile::Pane(widget) = tile {
                 widget.reset_database();
             }
         }
-        self.enforce_single_bus_if_needed(state);
-        true
+    }
+
+    fn apply_source(
+        &mut self,
+        state: &mut ViewerState,
+        source: Option<ConnectionSource>,
+        database_override: Option<Box<DatabaseSelection>>,
+    ) {
+        let was_beamng = matches!(self.active_source, Some(ConnectionSource::BeamNg(_)));
+        match (was_beamng, database_override) {
+            (false, Some(database)) => {
+                self.hardware_database = state.database.replace(*database);
+                Self::reset_database_widgets(state);
+            }
+            (true, None) => {
+                state.database = self.hardware_database.take();
+                Self::reset_database_widgets(state);
+            }
+            _ => {}
+        }
+        if self.active_source != source {
+            state.router.reset_live(daqnative::time::Time::now());
+            state.bus_load_samples.clear();
+        }
+        self.active_source = source;
     }
 
     pub fn connect_can(&mut self, state: &mut ViewerState) {
@@ -515,13 +565,10 @@ impl ViewerPlatform for DesktopPlatform {
                 daqnative::can_thread::CanThreadEvent::Frame(frame) => {
                     state.router.ingest_frame(frame);
                 }
-                daqnative::can_thread::CanThreadEvent::SourceSelected(Some(source)) => {
-                    if self.active_source.as_ref() != Some(&source) {
-                        state.router.reset_live(daqnative::time::Time::now());
-                        state.bus_load_samples.clear();
-                    }
-                    self.active_source = Some(source);
-                }
+                daqnative::can_thread::CanThreadEvent::SourceSelected {
+                    source,
+                    database_override,
+                } => self.apply_source(state, source, database_override),
                 daqnative::can_thread::CanThreadEvent::ConnectionFailed(error) => {
                     state.connection_status = ConnectionStatus::Error(error)
                 }
@@ -657,6 +704,14 @@ impl ViewerPlatform for DesktopPlatform {
                     }
                     ui.separator();
                     ui.label("Simulated");
+                    let beamng = ConnectionSource::BeamNg(self.beamng_port);
+                    let label = beamng.display_name();
+                    if ui
+                        .selectable_value(&mut self.selected_source, Some(beamng), label)
+                        .changed()
+                    {
+                        do_connect = true;
+                    }
                     for (connected, label) in [
                         (true, "Simulated (connected)"),
                         (false, "Simulated (disconnected)"),
@@ -700,13 +755,33 @@ impl ViewerPlatform for DesktopPlatform {
             }
         });
 
+        let beamng_selected = matches!(self.selected_source, Some(ConnectionSource::BeamNg(_)));
+        if beamng_selected {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("BeamNG UDP port");
+                if ui
+                    .add(eframe::egui::DragValue::new(&mut self.beamng_port).range(1..=65535))
+                    .changed()
+                {
+                    self.selected_source = Some(ConnectionSource::BeamNg(self.beamng_port));
+                    self.connect_can(state);
+                    self.save_settings(state);
+                }
+            });
+        }
+
         ui.horizontal_wrapped(|ui| {
             let (status_icon, status_color) = match &state.connection_status {
                 ConnectionStatus::Disconnected => {
                     ("■ Disconnected".to_string(), eframe::egui::Color32::GRAY)
                 }
                 ConnectionStatus::Connected => {
-                    ("✔ Connected".to_string(), eframe::egui::Color32::GREEN)
+                    let label = if beamng_selected {
+                        "✔ Listening for BeamNG"
+                    } else {
+                        "✔ Connected"
+                    };
+                    (label.to_owned(), eframe::egui::Color32::GREEN)
                 }
                 ConnectionStatus::Error(e) => {
                     (format!("🔴 Error: {}", e), eframe::egui::Color32::RED)
@@ -725,9 +800,13 @@ impl ViewerPlatform for DesktopPlatform {
         ui.add_space(2.0);
 
         let pending = self.pending_database.is_some();
-        ui.add_enabled_ui(!pending, |ui| {
-            self.show_database_controls(ui, state);
-        });
+        if beamng_selected {
+            ui.label("Live signals use the built-in BeamNG definitions.");
+        } else {
+            ui.add_enabled_ui(!pending, |ui| {
+                self.show_database_controls(ui, state);
+            });
+        }
         if pending {
             ui.label("Applying database selection…");
         }
@@ -931,6 +1010,12 @@ impl DAQApp {
             selection_request: 0,
             can_bus_speed: settings.selected_speed,
             udp_port: settings.udp_port,
+            beamng_port: match settings.selected_source {
+                Some(ConnectionSource::BeamNg(port)) => port,
+                _ => settings.beamng_port,
+            }
+            .max(1),
+            hardware_database: None,
             hil_snapshot: daqnative::hil::engine::HilSnapshot::idle(),
             active_source: None,
             settings_dirty_since: None,
@@ -965,6 +1050,9 @@ impl DAQApp {
         });
         if let Some(path) = default_dbc_path {
             platform.request_database(&mut state, &path, preferred_selection);
+        }
+        if matches!(platform.selected_source, Some(ConnectionSource::BeamNg(_))) {
+            platform.connect_can(&mut state);
         }
         if state.cloud_auto_connect && !state.cloud_url.trim().is_empty() {
             state
@@ -1045,6 +1133,8 @@ mod tests {
             selection_request: 0,
             can_bus_speed: daqnative::connection::CanBusSpeed::Kbps500,
             udp_port: 5000,
+            beamng_port: daqcore::beamng::DEFAULT_PORT,
+            hardware_database: None,
             hil_snapshot: daqnative::hil::engine::HilSnapshot::idle(),
             active_source: None,
             settings_dirty_since: None,

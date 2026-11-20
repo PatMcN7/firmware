@@ -1,5 +1,5 @@
-use crate::{can, can_thread, hil};
-use std::{sync::mpsc, thread, time};
+use crate::{can, can_thread, connection::ConnectionSource, hil};
+use std::{path::PathBuf, sync::mpsc, thread, time};
 
 const HIL_UPDATE_INTERVAL: time::Duration = time::Duration::from_millis(50);
 const FIRMWARE_FRAMES_PER_BURST: usize = 8;
@@ -25,10 +25,15 @@ fn run_with_connection(
     mut connection: can_thread::connection::ConnectionManager,
 ) {
     let events = can_thread::events::Events(out);
-    let mut decoder = can_thread::decode::FrameDecoder::default();
+    let mut hardware_decoder = can_thread::decode::FrameDecoder::default();
+    let mut beamng_decoder = None;
     let mut sends = can_thread::tx::SendTable::default();
     let mut load = can::bus_load::BusLoadTracker::new(time::Instant::now());
-    let mut logger = config.log_folder.map(can::logger::DaqLogger::new);
+    let mut beamng_logger = config
+        .log_folder
+        .as_ref()
+        .map(|path| can::logger::DaqLogger::new(path.join("beamng")));
+    let mut hardware_logger = config.log_folder.map(can::logger::DaqLogger::new);
     let mut firmware = can_thread::firmware_session::FirmwareSession::default();
     let mut hil = hil::engine::HilEngine::new(config.hil_dir);
     let mut hil_last = time::Instant::now();
@@ -64,16 +69,58 @@ fn run_with_connection(
                         emit!(can_thread::CanThreadEvent::FirmwareProgress(progress));
                     }
                     let now = time::Instant::now();
+                    let database_override = if matches!(source, Some(ConnectionSource::BeamNg(_))) {
+                        match daqcore::beamng::database() {
+                            Ok(database) => Some(can_thread::DatabaseSelection {
+                                database,
+                                selection: can_thread::BusSelection::Single(0),
+                            }),
+                            Err(error) => {
+                                connection.select(None, now);
+                                beamng_decoder = None;
+                                emit!(can_thread::CanThreadEvent::SourceSelected {
+                                    source: None,
+                                    database_override: None,
+                                });
+                                emit!(can_thread::CanThreadEvent::ConnectionFailed(
+                                    error.to_string()
+                                ));
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    if beamng_decoder.is_some() || database_override.is_some() {
+                        sends = can_thread::tx::SendTable::default();
+                        hil.handle_command(hil::engine::HilCommand::Stop, now);
+                        hil_capture_complete = false;
+                        let logger = if beamng_decoder.is_some() {
+                            &mut beamng_logger
+                        } else {
+                            &mut hardware_logger
+                        };
+                        if let Some(logger) = logger {
+                            logger.flush();
+                        }
+                        emit!(can_thread::CanThreadEvent::Hil(hil.snapshot(now)));
+                    }
+                    beamng_decoder = database_override
+                        .clone()
+                        .map(can_thread::decode::FrameDecoder::from_selection);
                     connection.select(source.clone(), now);
                     load.reset(now);
-                    emit!(can_thread::CanThreadEvent::SourceSelected(source));
+                    emit!(can_thread::CanThreadEvent::SourceSelected {
+                        source,
+                        database_override: database_override.map(Box::new),
+                    });
                     emit!(can_thread::CanThreadEvent::Disconnection);
                 }
                 can_thread::CanThreadCommand::SelectDatabase {
                     request_id,
                     selection,
                 } => {
-                    let update = match decoder.select(&selection) {
+                    let update = match hardware_decoder.select(&selection) {
                         Ok(update) => update,
                         Err(error) => {
                             emit!(can_thread::CanThreadEvent::DatabaseSelected {
@@ -88,7 +135,7 @@ fn run_with_connection(
                     hil.handle_command(hil::engine::HilCommand::Stop, now);
                     hil_capture_complete = false;
                     load.reset(now);
-                    if let Some(logger) = &mut logger {
+                    if let Some(logger) = &mut hardware_logger {
                         logger.flush();
                     }
                     emit!(can_thread::CanThreadEvent::DatabaseSelected {
@@ -109,10 +156,10 @@ fn run_with_connection(
                     }
                 }
                 can_thread::CanThreadCommand::DeleteSendMessage { key } => sends.delete(key),
-                can_thread::CanThreadCommand::UpdateLogFolder(path) => match &mut logger {
-                    Some(logger) => logger.update_folder(path),
-                    None => logger = Some(can::logger::DaqLogger::new(path)),
-                },
+                can_thread::CanThreadCommand::UpdateLogFolder(path) => {
+                    update_log_folder(&mut beamng_logger, path.join("beamng"));
+                    update_log_folder(&mut hardware_logger, path);
+                }
                 can_thread::CanThreadCommand::Hil(command) => {
                     let now = time::Instant::now();
                     hil.handle_command(command, now);
@@ -124,14 +171,18 @@ fn run_with_connection(
                     let progress = firmware.start(
                         package,
                         false,
-                        connection.connected(),
+                        connection.connected() && beamng_decoder.is_none(),
                         time::Instant::now(),
                     );
                     emit!(can_thread::CanThreadEvent::FirmwareProgress(progress));
                 }
                 can_thread::CanThreadCommand::ArmFirmwareUpdate(package) => {
-                    let progress =
-                        firmware.start(package, true, connection.connected(), time::Instant::now());
+                    let progress = firmware.start(
+                        package,
+                        true,
+                        connection.connected() && beamng_decoder.is_none(),
+                        time::Instant::now(),
+                    );
                     emit!(can_thread::CanThreadEvent::FirmwareProgress(progress));
                 }
                 can_thread::CanThreadCommand::CancelFirmwareUpdate => {
@@ -142,12 +193,19 @@ fn run_with_connection(
             }
         }
 
+        let decoder = beamng_decoder.as_ref().unwrap_or(&hardware_decoder);
+        let logger = if beamng_decoder.is_some() {
+            &mut beamng_logger
+        } else {
+            &mut hardware_logger
+        };
+
         // Reconnect the selected source when its retry delay has elapsed.
         let now = time::Instant::now();
         if let Some(result) = connection.connect(now, &decoder.active_buses()) {
             match result {
                 Ok(()) => {
-                    if let Some(logger) = &mut logger {
+                    if let Some(logger) = logger {
                         logger.reset_start_time();
                     }
                     emit!(can_thread::CanThreadEvent::ConnectionSuccessful);
@@ -242,7 +300,7 @@ fn run_with_connection(
                         let raw_bus_id = decoder.raw_frame_bus(&frame);
                         // Bus ID is 3 bits so 0-7 supported
                         if raw_bus_id <= 7
-                            && let Some(logger) = &mut logger
+                            && let Some(logger) = logger
                             && let Err(error) = logger.log_frame(&frame, raw_bus_id)
                         {
                             emit!(can_thread::CanThreadEvent::Diagnostic(error));
@@ -312,9 +370,19 @@ fn run_with_connection(
         let _ = events.emit(can_thread::CanThreadEvent::FirmwareProgress(progress));
     }
 
-    if let Some(logger) = &mut logger {
+    for logger in [&mut hardware_logger, &mut beamng_logger]
+        .into_iter()
+        .flatten()
+    {
         logger.flush();
     }
 
     connection.close();
+}
+
+fn update_log_folder(logger: &mut Option<can::logger::DaqLogger>, path: PathBuf) {
+    match logger {
+        Some(logger) => logger.update_folder(path),
+        None => *logger = Some(can::logger::DaqLogger::new(path)),
+    }
 }

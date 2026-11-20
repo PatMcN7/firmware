@@ -1,5 +1,6 @@
 //! Portable DAQ telemetry kernel, timeline, router, formula engine, SuperDBC codec, and traits.
 pub mod analysis;
+pub mod beamng;
 pub mod bus_load;
 pub mod connection;
 pub mod export;

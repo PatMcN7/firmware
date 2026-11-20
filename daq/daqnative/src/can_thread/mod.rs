@@ -67,7 +67,10 @@ pub enum CanThreadEvent {
         result: Result<DatabaseUpdate, String>,
     },
     Frame(frame::ParsedFrame),
-    SourceSelected(Option<crate::connection::ConnectionSource>),
+    SourceSelected {
+        source: Option<crate::connection::ConnectionSource>,
+        database_override: Option<Box<DatabaseSelection>>,
+    },
     Disconnection,
     ConnectionSuccessful,
     ConnectionFailed(String),

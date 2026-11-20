@@ -54,6 +54,9 @@ pub fn create_driver(
                 .map_err(|e| DriverError::ConnectionFailed(e.to_string()))?;
             Ok(Box::new(UdpDriver(socket)))
         }
+        connection::ConnectionSource::BeamNg(port) => {
+            Ok(Box::new(super::beamng::BeamNgDriver::bind(*port)?))
+        }
         connection::ConnectionSource::Cannector => Ok(Box::new(CannectorDriver::new()?)),
         connection::ConnectionSource::Loopback => Ok(Box::new(LoopbackDriver::default())),
         connection::ConnectionSource::Simulated(true) => {
